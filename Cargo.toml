@@ -1,0 +1,24 @@
+[package]
+name = "fast-csv"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, xan-style CSV column validation with a small rule DSL"
+license = "MIT"
+
+[[bin]]
+name = "fvalidate"
+path = "src/main.rs"
+
+[dependencies]
+simd-csv = "0.14"
+rayon = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

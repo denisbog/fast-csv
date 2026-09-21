@@ -1,0 +1,295 @@
+//! End-to-end tests running the compiled `fvalidate` binary.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use serde_json::Value;
+
+fn manifest(relative: &str) -> String {
+    format!("{}/{}", env!("CARGO_MANIFEST_DIR"), relative)
+}
+
+fn run(args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(env!("CARGO_BIN_EXE_fvalidate"))
+        .args(args)
+        .output()
+        .expect("failed to run fvalidate");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
+}
+
+fn run_json(args: &[&str]) -> Value {
+    let (stdout, stderr, ok) = run(args);
+    assert!(ok, "fvalidate failed: {stderr}");
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid json: {e}\n{stdout}"))
+}
+
+fn people_rules() -> String {
+    manifest("examples/rules.vl")
+}
+
+#[test]
+fn reports_counts_and_ambiguities() {
+    let rules = people_rules();
+    let report = run_json(&[
+        &manifest("examples/people.csv"),
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    assert_eq!(report["rules_total"], 4);
+    assert_eq!(report["rows_checked"], 8);
+
+    let rules = report["rules"].as_array().unwrap();
+
+    // Dates: 3 failures (two mismatches + one unparseable).
+    let dates = &rules[0];
+    assert_eq!(dates["rows_passed"], 5);
+    assert_eq!(dates["rows_failed"], 3);
+    assert_eq!(dates["transform_errors"], 1);
+    assert_eq!(dates["status"], "failed");
+
+    // Country mapping is auto-extracted and ambiguous for "france".
+    let country = &rules[1];
+    assert_eq!(country["mapping"]["source"], "auto");
+    assert_eq!(country["mapping"]["distinct_inputs"], 4);
+    assert_eq!(country["mapping"]["ambiguous_inputs"], 1);
+    assert_eq!(country["mapping"]["ambiguities"][0]["input"], "france");
+
+    // Multi-value comparison is order independent (b;c == c;b).
+    let tags = &rules[2];
+    assert_eq!(tags["rows_passed"], 7);
+    assert_eq!(tags["rows_failed"], 1);
+
+    // File mapping reports its ambiguity too.
+    let city = &rules[3];
+    assert_eq!(city["mapping"]["source"], "file");
+    assert_eq!(city["mapping"]["ambiguous_inputs"], 1);
+    assert_eq!(city["rows_failed"], 0);
+    assert_eq!(city["status"], "failed");
+}
+
+#[test]
+fn example_limit_is_respected() {
+    let rules = people_rules();
+    let report = run_json(&[
+        &manifest("examples/people.csv"),
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+        "-n",
+        "2",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    for rule in report["rules"].as_array().unwrap() {
+        assert!(rule["pass_examples"].as_array().unwrap().len() <= 2);
+        assert!(rule["fail_examples"].as_array().unwrap().len() <= 2);
+        if let Some(mapping) = rule.get("mapping") {
+            if mapping.get("ambiguities").is_some() {
+                assert!(mapping["ambiguities"].as_array().unwrap().len() <= 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn exits_nonzero_when_a_rule_fails() {
+    let rules = people_rules();
+    let (_, _, ok) = run(&[
+        &manifest("examples/people.csv"),
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+    ]);
+    assert!(!ok, "expected a non-zero exit code");
+}
+
+#[test]
+fn reads_from_stdin() {
+    let csv = std::fs::read_to_string(manifest("examples/people.csv")).unwrap();
+    let rules = people_rules();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fvalidate"))
+        .args([
+            "-",
+            "-r",
+            &rules,
+            "--id-column",
+            "id",
+            "--format",
+            "json",
+            "--no-fail",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(csv.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["rows_checked"], 8);
+}
+
+/// A composite key built from two input columns must be validated as a pair.
+#[test]
+fn composite_keys_use_two_input_values() {
+    let report = run_json(&[
+        &manifest("examples/orders.csv"),
+        "-r",
+        &manifest("examples/rules_composite.vl"),
+        "--id-column",
+        "order_id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    assert_eq!(report["rows_checked"], 7);
+    let rules = report["rules"].as_array().unwrap();
+
+    // Reference-table lookup keyed by (product, region).
+    let reference = &rules[0];
+    assert_eq!(reference["left"], "product + region");
+    assert_eq!(reference["mapping"]["source"], "file");
+    assert_eq!(reference["mapping"]["distinct_inputs"], 5);
+    assert_eq!(reference["rows_passed"], 5);
+    assert_eq!(reference["rows_failed"], 2);
+    assert_eq!(reference["mapping"]["entries"][0]["input"], "gadget|eu");
+
+    // Same key extracted from the data: the noisy rows make it ambiguous.
+    let auto = &rules[1];
+    assert_eq!(auto["mapping"]["source"], "auto");
+    assert_eq!(auto["mapping"]["ambiguous_inputs"], 2);
+    assert_eq!(auto["rows_failed"], 2);
+}
+
+#[test]
+fn html_report_is_self_contained() {
+    let rules = people_rules();
+    let (stdout, stderr, ok) = run(&[
+        &manifest("examples/people.csv"),
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+        "--format",
+        "html",
+        "--no-fail",
+    ]);
+    assert!(ok, "fvalidate failed: {stderr}");
+    assert!(stdout.starts_with("<!DOCTYPE html>"), "missing doctype");
+    assert!(stdout.contains("<style>"), "css should be embedded");
+    assert!(stdout.contains("country name maps to code"));
+    assert!(stdout.contains("class=\"rule failed\""));
+    assert!(stdout.contains("Ambiguous input"));
+    assert!(stdout.contains("</html>"));
+}
+
+#[test]
+fn html_escapes_hostile_values() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-html-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("evil.csv");
+    std::fs::write(&csv_path, "id,a,b\n1,\"<script>alert(1)</script>\",\"x & y\"\n").unwrap();
+    let rules_path = dir.join("evil.vl");
+    std::fs::write(&rules_path, "rule \"escape\" {\n left = a\n right = b\n}\n").unwrap();
+
+    let (stdout, _, ok) = run(&[
+        csv_path.to_str().unwrap(),
+        "-r",
+        rules_path.to_str().unwrap(),
+        "--id-column",
+        "id",
+        "--format",
+        "html",
+        "--no-fail",
+    ]);
+    assert!(ok);
+    assert!(!stdout.contains("<script>alert"), "raw markup leaked");
+    assert!(stdout.contains("&lt;script&gt;alert"));
+    assert!(stdout.contains("x &amp; y"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Parallel and sequential runs must agree on every statistic; only the
+/// per-row `row` number is unavailable in parallel mode.
+#[test]
+fn parallel_matches_sequential() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+
+    let mut csv = String::from("id,country_name,country_code,start_date,end_date,tags,ref_tags,city,city_code\n");
+    for i in 1..=5000u32 {
+        let country = if i % 3 == 0 { "France" } else { "USA" };
+        let code = if i % 97 == 0 { "FR" } else { "US" };
+        csv.push_str(&format!(
+            "{i},{country},{code},2020-01-01,2020-01-0{},a;b,a;b,Paris,PAR\n",
+            (i % 9) + 1
+        ));
+    }
+    std::fs::write(&csv_path, csv).unwrap();
+
+    let rules = people_rules();
+    let csv_str = csv_path.to_str().unwrap();
+    let sequential = run_json(&[
+        csv_str, "-r", &rules, "--id-column", "id", "-j", "1", "--format", "json", "--no-fail",
+    ]);
+    let parallel = run_json(&[
+        csv_str, "-r", &rules, "--id-column", "id", "-j", "4", "--format", "json", "--no-fail",
+    ]);
+
+    assert_eq!(strip_rows(sequential), strip_rows(parallel));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn strip_rows(mut report: Value) -> Value {
+    if let Some(rules) = report["rules"].as_array_mut() {
+        for rule in rules {
+            for key in ["pass_examples", "fail_examples"] {
+                if let Some(examples) = rule[key].as_array_mut() {
+                    for example in examples {
+                        example.as_object_mut().unwrap().remove("row");
+                    }
+                }
+            }
+            if let Some(ambiguities) = rule
+                .get_mut("mapping")
+                .and_then(|m| m.get_mut("ambiguities"))
+                .and_then(|a| a.as_array_mut())
+            {
+                for ambiguity in ambiguities {
+                    if let Some(examples) = ambiguity["examples"].as_array_mut() {
+                        for example in examples {
+                            example.as_object_mut().unwrap().remove("row");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report
+}
