@@ -2,8 +2,11 @@
 
 use std::path::PathBuf;
 
+use regex::Regex;
+
 use crate::compare::CompareOp;
 use crate::dsl::{MappingSourceDef, Program};
+use crate::pattern::Separator;
 use crate::transform::Transform;
 
 /// Resolve a column reference (a header name or `#index`) against headers.
@@ -41,7 +44,7 @@ pub enum MappingPlan {
         left: Vec<String>,
         right: Vec<String>,
         multi: bool,
-        separator: String,
+        separator: Separator,
     },
 }
 
@@ -58,8 +61,10 @@ pub struct CompiledRule {
     pub transform_right: Vec<Transform>,
     pub compare: CompareOp,
     pub multi: bool,
-    pub separator: String,
+    pub separator: Separator,
     pub join_separator: String,
+    /// Compiled regex for `compare = matches | not_matches`.
+    pub pattern: Option<Regex>,
     pub mapping: MappingPlan,
     pub report_limit: usize,
 }
@@ -99,12 +104,31 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             .separator
             .clone()
             .unwrap_or_else(|| program.defaults.separator.clone());
-        let compare = def.compare.unwrap_or(program.defaults.compare);
         let report_limit = def.report_limit.unwrap_or(program.defaults.report_limit);
         let join_separator = def
             .join_separator
             .clone()
             .unwrap_or_else(|| program.defaults.join_separator.clone());
+
+        // `pattern` implies a regex comparison unless stated otherwise.
+        let compare = match def.compare {
+            Some(compare) => compare,
+            None if def.pattern.is_some() => CompareOp::Matches,
+            None => program.defaults.compare,
+        };
+        if compare.is_regex() && def.pattern.is_none() {
+            return Err(format!(
+                "rule '{}': compare = {} requires a `pattern`",
+                def.name,
+                compare.as_str()
+            ));
+        }
+        if def.pattern.is_some() && def.right.is_empty() && !compare.is_regex() {
+            return Err(format!(
+                "rule '{}': `pattern` with a non-regex comparison needs a `right` column",
+                def.name
+            ));
+        }
 
         let mapping = match &def.mapping {
             MappingSourceDef::None => MappingPlan::None,
@@ -120,14 +144,22 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
                 left: left.clone(),
                 right: right.clone(),
                 multi: *multi,
-                separator: separator.clone(),
+                separator: separator
+                    .clone()
+                    .unwrap_or_else(|| program.defaults.mapping_separator.clone()),
             },
+        };
+
+        let right_name = if def.right.is_empty() {
+            "(pattern)".to_string()
+        } else {
+            def.right.join(" + ")
         };
 
         rules.push(CompiledRule {
             name: def.name,
             left_name: def.left.join(" + "),
-            right_name: def.right.join(" + "),
+            right_name,
             left_idx,
             right_idx,
             transform_left: def.transform_left,
@@ -136,6 +168,7 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             multi,
             separator,
             join_separator,
+            pattern: def.pattern,
             mapping,
             report_limit,
         });

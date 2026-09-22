@@ -16,6 +16,10 @@ pub enum CompareOp {
     Superset,
     /// The sets share at least one token.
     Intersect,
+    /// The value matches a rule-level regex `pattern`.
+    Matches,
+    /// The value does not match a rule-level regex `pattern`.
+    NotMatches,
 }
 
 impl CompareOp {
@@ -26,7 +30,25 @@ impl CompareOp {
             "subset" | "in" | "contains_all_reverse" => Some(CompareOp::Subset),
             "superset" | "contains" => Some(CompareOp::Superset),
             "intersect" | "overlap" | "any" => Some(CompareOp::Intersect),
+            "matches" | "match" | "=~" | "regex" => Some(CompareOp::Matches),
+            "not_matches" | "nomatch" | "!~" | "not_match" => Some(CompareOp::NotMatches),
             _ => None,
+        }
+    }
+
+    pub fn is_regex(&self) -> bool {
+        matches!(self, CompareOp::Matches | CompareOp::NotMatches)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompareOp::Eq => "eq",
+            CompareOp::Ne => "ne",
+            CompareOp::Subset => "subset",
+            CompareOp::Superset => "superset",
+            CompareOp::Intersect => "intersect",
+            CompareOp::Matches => "matches",
+            CompareOp::NotMatches => "not_matches",
         }
     }
 
@@ -38,6 +60,9 @@ impl CompareOp {
             CompareOp::Subset => is_subset(expected, actual),
             CompareOp::Superset => is_subset(actual, expected),
             CompareOp::Intersect => intersect(expected, actual),
+            // Regex comparisons need a compiled pattern and are evaluated by
+            // the engine before this point.
+            CompareOp::Matches | CompareOp::NotMatches => false,
         }
     }
 }

@@ -5,6 +5,7 @@
 //! reuses one buffer per side across every row).
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use regex::Regex;
 
 /// A single transformation step.
 #[derive(Debug, Clone)]
@@ -25,6 +26,15 @@ pub enum Transform {
     /// Normalize common boolean spellings to `true` / `false`.
     Bool,
     Replace { from: String, to: String },
+    /// Regex replacement (xan's `replace(string, regex(...), replacement)`),
+    /// supporting capture groups in `replacement` (`$1`, `${name}`).
+    RegexReplace { pattern: Regex, replacement: String },
+    /// Extract a capture group from the first regex match (xan's
+    /// `match(string, regex(...), group)`). Group 0 is the whole match.
+    RegexExtract { pattern: Regex, group: usize },
+    /// Keep only the characters matching the regex (all non-overlapping
+    /// matches concatenated).
+    RegexKeep { pattern: Regex },
     Prefix(String),
     Suffix(String),
 }
@@ -114,6 +124,32 @@ impl Transform {
                     out.push_str(&input.replace(from.as_str(), to));
                 } else {
                     out.push_str(input);
+                }
+                true
+            }
+            Transform::RegexReplace {
+                pattern,
+                replacement,
+            } => {
+                // `replace_all` borrows the input when nothing matched.
+                out.push_str(&pattern.replace_all(input, replacement.as_str()));
+                true
+            }
+            Transform::RegexExtract { pattern, group } => {
+                match pattern.captures(input).and_then(|caps| caps.get(*group)) {
+                    Some(captured) => {
+                        out.push_str(captured.as_str());
+                        true
+                    }
+                    None => {
+                        out.push_str(input);
+                        false
+                    }
+                }
+            }
+            Transform::RegexKeep { pattern } => {
+                for matched in pattern.find_iter(input) {
+                    out.push_str(matched.as_str());
                 }
                 true
             }
@@ -284,6 +320,46 @@ mod tests {
         out.clear();
         assert!(Transform::Bool.write_into("0", &mut out));
         assert_eq!(out, "false");
+    }
+
+    #[test]
+    fn regex_transforms() {
+        let mut out = String::new();
+
+        let strip = Transform::RegexReplace {
+            pattern: Regex::new("[^0-9]").unwrap(),
+            replacement: String::new(),
+        };
+        assert!(strip.write_into("+33 6 12", &mut out));
+        assert_eq!(out, "33612");
+
+        let extract = Transform::RegexExtract {
+            pattern: Regex::new(r"(\d{4})-(\d{2})").unwrap(),
+            group: 2,
+        };
+        out.clear();
+        assert!(extract.write_into("2020-07-01", &mut out));
+        assert_eq!(out, "07");
+
+        // No match is a failed transform and leaves the input untouched.
+        out.clear();
+        assert!(!extract.write_into("not a date", &mut out));
+        assert_eq!(out, "not a date");
+
+        let reorder = Transform::RegexReplace {
+            pattern: Regex::new(r"(\w+)@(\w+)").unwrap(),
+            replacement: "$2/$1".to_string(),
+        };
+        out.clear();
+        assert!(reorder.write_into("bob@example", &mut out));
+        assert_eq!(out, "example/bob");
+
+        let keep = Transform::RegexKeep {
+            pattern: Regex::new(r"\d").unwrap(),
+        };
+        out.clear();
+        assert!(keep.write_into("a1b2c3", &mut out));
+        assert_eq!(out, "123");
     }
 
     #[test]

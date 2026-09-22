@@ -2,6 +2,7 @@ mod compare;
 mod dsl;
 mod engine;
 mod mapping;
+mod pattern;
 mod report;
 mod rules;
 mod sampler;

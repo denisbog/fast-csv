@@ -233,6 +233,42 @@ fn html_escapes_hostile_values() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// xan-style regex: `regex(...)` in transforms, a rule `pattern`, and a
+/// regex separator.
+#[test]
+fn regex_constructs_work() {
+    let report = run_json(&[
+        &manifest("examples/contacts.csv"),
+        "-r",
+        &manifest("examples/rules_regex.vl"),
+        "--id-column",
+        "contact_id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    assert_eq!(report["rows_checked"], 5);
+    let rules = report["rules"].as_array().unwrap();
+
+    // `replace(regex("[^0-9]"), "")`
+    assert_eq!(rules[0]["rows_passed"], 3);
+    assert_eq!(rules[0]["rows_failed"], 2);
+
+    // `pattern` + `compare = matches`, with no `right` column.
+    assert_eq!(rules[1]["right"], "(pattern)");
+    assert_eq!(rules[1]["rows_passed"], 4);
+    assert_eq!(rules[1]["rows_failed"], 1);
+
+    // `match(regex("^([^@]+)@"), 1)`; a missing match is a transform error.
+    assert_eq!(rules[2]["rows_passed"], 4);
+    assert_eq!(rules[2]["transform_errors"], 1);
+
+    // `separator = regex("\\s*[;,|]\\s*")`
+    assert_eq!(rules[3]["status"], "passed");
+    assert_eq!(rules[3]["rows_passed"], 5);
+}
+
 /// Parallel and sequential runs must agree on every statistic; only the
 /// per-row `row` number is unavailable in parallel mode.
 #[test]

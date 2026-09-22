@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use simd_csv::ByteRecord;
 
+use crate::compare::CompareOp;
 use crate::mapping::{self, MapCounts, Mapping, MappingOrigin};
+use crate::pattern::Separator;
 use crate::report::{
     AmbiguityReport, Example, MappingEntry, MappingReport, Report, RuleReport, TargetExample,
 };
@@ -211,7 +213,7 @@ impl Slots {
 // Pass 1: build auto mappings
 // ---------------------------------------------------------------------------
 
-fn fill_tokens(buffer: &str, multi: bool, separator: &str, out: &mut Vec<String>) {
+fn fill_tokens(buffer: &str, multi: bool, separator: &Separator, out: &mut Vec<String>) {
     out.clear();
     out.extend(
         mapping::split_tokens(buffer, multi, separator)
@@ -345,9 +347,8 @@ fn validate_segment(
                 &mut component_buf,
                 &mut right_buf,
             );
-            fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
-            fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
-
+            // Regex rules only need the left value: the rule-level pattern
+            // decides the outcome, mirroring xan's `match(value, regex(...))`.
             let id = match slots.id_slot {
                 Some(slot) => {
                     let value = cells[slot].trim();
@@ -360,44 +361,59 @@ fn validate_segment(
                 None => format!("row:{}", row_number.unwrap_or(local_row)),
             };
 
-            expected_buf.clear();
-            if let Some(mapping) = &mappings[rule_index] {
-                for token in &left_tokens {
-                    match mapping.expected(token) {
-                        Some(target) => expected_buf.push(target.to_string()),
-                        None => {
-                            accum.unmapped += 1;
-                            expected_buf.push(format!("\u{0}unmapped:{token}"));
+            let expected_repr: Option<String>;
+            let matched;
+
+            if let Some(pattern) = &rule.pattern {
+                let is_match = pattern.is_match(&left_buf);
+                matched = match rule.compare {
+                    CompareOp::NotMatches => left_ok && !is_match,
+                    _ => left_ok && is_match,
+                };
+                expected_repr = Some(pattern.as_str().to_string());
+            } else {
+                fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
+                fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
+
+                expected_buf.clear();
+                if let Some(mapping) = &mappings[rule_index] {
+                    for token in &left_tokens {
+                        match mapping.expected(token) {
+                            Some(target) => expected_buf.push(target.to_string()),
+                            None => {
+                                accum.unmapped += 1;
+                                expected_buf.push(format!("\u{0}unmapped:{token}"));
+                            }
+                        }
+
+                        if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
+                            accum.ambiguous_samples.offer(
+                                token,
+                                Example {
+                                    id: id.clone(),
+                                    row: row_number,
+                                    left: token.clone(),
+                                    right: right_buf.clone(),
+                                    expected: mapping.expected(token).map(str::to_string),
+                                },
+                            );
                         }
                     }
-
-                    if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
-                        accum.ambiguous_samples.offer(
-                            token,
-                            Example {
-                                id: id.clone(),
-                                row: row_number,
-                                left: token.clone(),
-                                right: right_buf.clone(),
-                                expected: mapping.expected(token).map(str::to_string),
-                            },
-                        );
-                    }
+                } else {
+                    expected_buf.extend(left_tokens.iter().cloned());
                 }
-            } else {
-                expected_buf.extend(left_tokens.iter().cloned());
+
+                actual_buf.clear();
+                actual_buf.extend(right_tokens.iter().cloned());
+
+                expected_buf.sort_unstable();
+                expected_buf.dedup();
+                actual_buf.sort_unstable();
+                actual_buf.dedup();
+
+                matched = left_ok && right_ok && rule.compare.evaluate(&expected_buf, &actual_buf);
+                expected_repr = mapping_expected(mappings[rule_index].as_ref(), &expected_buf);
             }
-
-            actual_buf.clear();
-            actual_buf.extend(right_tokens.iter().cloned());
-
-            expected_buf.sort_unstable();
-            expected_buf.dedup();
-            actual_buf.sort_unstable();
-            actual_buf.dedup();
-
-            let matched =
-                left_ok && right_ok && rule.compare.evaluate(&expected_buf, &actual_buf);
 
             accum.checked += 1;
             if !left_ok || !right_ok {
@@ -414,7 +430,7 @@ fn validate_segment(
                             row: row_number,
                             left: left_buf.clone(),
                             right: right_buf.clone(),
-                            expected: mapping_expected(mappings[rule_index].as_ref(), &expected_buf),
+                            expected: expected_repr.clone(),
                         },
                     );
                 }
@@ -428,7 +444,7 @@ fn validate_segment(
                             row: row_number,
                             left: left_buf.clone(),
                             right: right_buf.clone(),
-                            expected: mapping_expected(mappings[rule_index].as_ref(), &expected_buf),
+                            expected: expected_repr.clone(),
                         },
                     );
                 }

@@ -126,10 +126,11 @@ several lines as long as brackets/quotes balance.
 | --- | --- |
 | `left`, `right` | Columns to compare: a header name, `#index`, or a list of columns `[a, b]` forming a composite key. |
 | `transform_left`, `transform_right` | Normalization pipeline (see below). With several columns it is applied to **each** component before joining. |
-| `compare` | `eq` (default), `ne`, `subset`, `superset`, `intersect`. Operates on token sets. |
+| `compare` | `eq` (default), `ne`, `subset`, `superset`, `intersect`, or regex `matches` / `not_matches`. Operates on token sets. |
 | `multi` | Split cells into multiple values before comparing (default `false`). |
-| `separator` | Token separator used when `multi = true`. |
+| `separator` | Token separator when `multi = true`; a plain string or `regex("...")`. |
 | `join_separator` | Glue used to combine several columns of one side into a single key (default `|`). |
+| `pattern` | Rule-level regex used by `compare = matches` / `not_matches`; `right` may then be omitted. |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
 | `mapping_left`, `mapping_right` | Column(s) inside the reference files; lists are allowed. |
@@ -179,6 +180,51 @@ Applied left-to-right, zero allocation after warm-up:
   first matching format (`RFC 3339` as a last resort) and re-emits with `out`.
 * `int`, `float`, `bool` — canonical numeric/boolean forms.
 * `replace(from, to)`, `prefix(s)`, `suffix(s)`
+* **Regex** (see [Regex expressions](#regex-expressions)):
+  `replace(regex("p"), "r")`, `regex_replace("p", "r")`, `match(regex("p")[, group])`,
+  `regex_keep(regex("p"))`.
+
+### Regex expressions
+
+Regex support mirrors xan: `regex("...")` compiles a pattern once (at rule
+compile time) and is used by other expressions.
+
+| Expression | xan equivalent | Behaviour |
+| --- | --- | --- |
+| `regex("p")` | `regex("p")` | A compiled pattern value. Bare as a transform it extracts the whole match. |
+| `replace(regex("p"), "r")` | `replace(s, regex("p"), "r")` | Regex replacement with capture groups (`$1`, `${name}`). A plain string stays a literal replace. |
+| `regex_replace("p", "r")` | — | Regex replacement where the pattern may be a plain string. |
+| `match(regex("p")[, n])` | `match(s, regex("p"), n)` | Extracts capture group `n` (default `0`, the whole match). A missing match is a transform error (the value is left unchanged). |
+| `regex_keep(regex("p"))` | — | Keeps only the concatenation of all matches (e.g. strip non-digits). |
+| `separator = regex("p")` | `split(s, regex("p"))` | Splits multi-value cells on a regex. |
+| `pattern` + `compare = matches` | `match(s, regex("p"))` as a filter | Validates the `left` value against a rule-level regex; `right` is optional. `not_matches` inverts it. |
+
+```text
+rule "phone digits" {
+  left           = phone_raw
+  right          = phone_digits
+  transform_left = replace(regex("[^0-9]"), "")     # xan-style regex replace
+}
+
+rule "email shape" {
+  left    = email
+  pattern = "^[^@[:space:]]+@[^@[:space:]]+\\.[A-Za-z]{2,}$"
+  compare = matches                                   # single-column validation
+}
+
+rule "tags (regex separator)" {
+  left      = tags
+  right     = ref_tags
+  multi     = true
+  separator = regex("\\s*[;,|]\\s*")                  # split on ; , or |
+}
+```
+
+Run the bundled example:
+
+```bash
+fvalidate examples/contacts.csv -r examples/rules_regex.vl --id-column contact_id
+```
 
 ### Comparison semantics
 
@@ -284,6 +330,8 @@ examples/
   orders.csv    composite-key fixture
   warehouse_map.csv
   rules_composite.vl   two-input-value example
+  contacts.csv  regex fixture
+  rules_regex.vl       regex example
 ```
 
 ## Tests

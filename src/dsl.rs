@@ -42,7 +42,10 @@
 
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
+
 use crate::compare::CompareOp;
+use crate::pattern::Separator;
 use crate::transform::Transform;
 
 /// A parsed DSL value.
@@ -97,17 +100,17 @@ pub enum MappingSourceDef {
         /// One or more columns forming the target value.
         right: Vec<String>,
         multi: bool,
-        separator: String,
+        separator: Option<Separator>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub struct RuleDefaults {
-    pub separator: String,
+    pub separator: Separator,
     pub multi: bool,
     pub compare: CompareOp,
     pub report_limit: usize,
-    pub mapping_separator: String,
+    pub mapping_separator: Separator,
     /// Joins several columns into a single composite key.
     pub join_separator: String,
 }
@@ -115,11 +118,11 @@ pub struct RuleDefaults {
 impl Default for RuleDefaults {
     fn default() -> Self {
         RuleDefaults {
-            separator: ",".to_string(),
+            separator: Separator::literal(","),
             multi: false,
             compare: CompareOp::Eq,
             report_limit: 10,
-            mapping_separator: ",".to_string(),
+            mapping_separator: Separator::literal(","),
             join_separator: "|".to_string(),
         }
     }
@@ -136,8 +139,10 @@ pub struct RuleDef {
     pub transform_right: Vec<Transform>,
     pub compare: Option<CompareOp>,
     pub multi: Option<bool>,
-    pub separator: Option<String>,
+    pub separator: Option<Separator>,
     pub join_separator: Option<String>,
+    /// Rule-level regex used by `compare = matches | not_matches`.
+    pub pattern: Option<Regex>,
     pub mapping: MappingSourceDef,
     pub report_limit: Option<usize>,
 }
@@ -212,6 +217,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     multi: None,
                     separator: None,
                     join_separator: None,
+                    pattern: None,
                     mapping: MappingSourceDef::None,
                     report_limit: None,
                 });
@@ -266,9 +272,12 @@ pub fn parse(text: &str) -> Result<Program, String> {
 }
 
 fn validate_rule(rule: RuleDef, line_no: usize) -> Result<RuleDef, String> {
-    if rule.left.is_empty() || rule.right.is_empty() {
+    if rule.left.is_empty() {
+        return Err(format!("rule '{}': `left` column is required", rule.name));
+    }
+    if rule.right.is_empty() && rule.pattern.is_none() {
         return Err(format!(
-            "rule '{}': both `left` and `right` columns are required",
+            "rule '{}': both `left` and `right` columns are required (or set `pattern`)",
             rule.name
         ));
     }
@@ -283,14 +292,14 @@ fn apply_default(
     line_no: usize,
 ) -> Result<(), String> {
     match key {
-        "separator" => defaults.separator = expect_string(value, key, line_no)?,
+        "separator" => defaults.separator = parse_separator(value, key, line_no)?,
         "multi" => defaults.multi = expect_bool(value, key, line_no)?,
         "compare" => {
             defaults.compare = CompareOp::parse(expect_string_ref(value, key, line_no)?)
                 .ok_or_else(|| format!("line {line_no}: unknown comparison operator"))?
         }
         "report_limit" => defaults.report_limit = expect_usize(value, key, line_no)?,
-        "mapping_separator" => defaults.mapping_separator = expect_string(value, key, line_no)?,
+        "mapping_separator" => defaults.mapping_separator = parse_separator(value, key, line_no)?,
         "join_separator" => defaults.join_separator = expect_string(value, key, line_no)?,
         other => return Err(format!("line {line_no}: unknown defaults key `{other}`")),
     }
@@ -315,8 +324,9 @@ fn apply_rule_key(
             )
         }
         "multi" => rule.multi = Some(expect_bool(value, key, line_no)?),
-        "separator" => rule.separator = Some(expect_string(value, key, line_no)?),
+        "separator" => rule.separator = Some(parse_separator(value, key, line_no)?),
         "join_separator" => rule.join_separator = Some(expect_string(value, key, line_no)?),
+        "pattern" => rule.pattern = Some(compile_pattern(value, key, line_no)?),
         "report_limit" => rule.report_limit = Some(expect_usize(value, key, line_no)?),
         "mapping" => {
             let raw = expect_string_ref(value, key, line_no)?;
@@ -351,7 +361,7 @@ fn apply_rule_key(
                 },
                 separator: match &rule.mapping {
                     MappingSourceDef::Files { separator, .. } => separator.clone(),
-                    _ => ",".to_string(),
+                    _ => None,
                 },
             };
         }
@@ -362,7 +372,7 @@ fn apply_rule_key(
                     left: Vec::new(),
                     right: Vec::new(),
                     multi: false,
-                    separator: ",".to_string(),
+                    separator: None,
                 };
             }
             if let MappingSourceDef::Files {
@@ -377,7 +387,7 @@ fn apply_rule_key(
                     "mapping_left" => *left = expect_string_or_list(value, key, line_no)?,
                     "mapping_right" => *right = expect_string_or_list(value, key, line_no)?,
                     "mapping_multi" => *multi = expect_bool(value, key, line_no)?,
-                    "mapping_separator" => *separator = expect_string(value, key, line_no)?,
+                    "mapping_separator" => *separator = Some(parse_separator(value, key, line_no)?),
                     _ => unreachable!(),
                 }
             }
@@ -389,6 +399,44 @@ fn apply_rule_key(
 
 fn expect_string(value: &Value, key: &str, line_no: usize) -> Result<String, String> {
     expect_string_ref(value, key, line_no).map(str::to_string)
+}
+
+/// Extract the pattern from a `regex("...")` call, if that is what the value
+/// is. Returns `None` for plain strings, which callers may treat as literals.
+fn regex_source(value: &Value) -> Option<&str> {
+    match value {
+        Value::Call(name, args) if name.trim().eq_ignore_ascii_case("regex") => {
+            args.first().and_then(Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a value to a regex pattern: either `regex("...")` or a plain
+/// string (also treated as a pattern, xan-style).
+fn regex_pattern(value: &Value, key: &str, line_no: usize) -> Result<String, String> {
+    if let Some(source) = regex_source(value) {
+        Ok(source.to_string())
+    } else {
+        expect_string(value, key, line_no)
+    }
+}
+
+fn compile_regex(source: &str, line_no: usize) -> Result<Regex, String> {
+    Regex::new(source).map_err(|e| format!("line {line_no}: invalid regex `{source}`: {e}"))
+}
+
+fn compile_pattern(value: &Value, key: &str, line_no: usize) -> Result<Regex, String> {
+    let source = regex_pattern(value, key, line_no)?;
+    compile_regex(&source, line_no)
+}
+
+/// A separator is a plain string, or a regex when wrapped in `regex("...")`.
+fn parse_separator(value: &Value, key: &str, line_no: usize) -> Result<Separator, String> {
+    match regex_source(value) {
+        Some(source) => Ok(Separator::Regex(compile_regex(source, line_no)?)),
+        None => Ok(Separator::Literal(expect_string(value, key, line_no)?)),
+    }
 }
 
 /// Accept either a single string or a list of strings. Used for `left`,
@@ -489,9 +537,65 @@ fn parse_transform(value: &Value, line_no: usize) -> Result<Option<Transform>, S
                 if args.len() != 2 {
                     return Err(format!("line {line_no}: replace(from, to) expects 2 arguments"));
                 }
-                Ok(Transform::Replace {
-                    from: expect_string(&args[0], "replace", line_no)?,
-                    to: expect_string(&args[1], "replace", line_no)?,
+                // xan-style: `replace(regex("p"), "r")` performs a regex
+                // replacement with capture-group references; a plain string is
+                // a literal replacement.
+                if let Some(source) = regex_source(&args[0]) {
+                    Ok(Transform::RegexReplace {
+                        pattern: compile_regex(source, line_no)?,
+                        replacement: expect_string(&args[1], "replace", line_no)?,
+                    })
+                } else {
+                    Ok(Transform::Replace {
+                        from: expect_string(&args[0], "replace", line_no)?,
+                        to: expect_string(&args[1], "replace", line_no)?,
+                    })
+                }
+            }
+            "regex_replace" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "line {line_no}: regex_replace(pattern, replacement) expects 2 arguments"
+                    ));
+                }
+                let source = regex_pattern(&args[0], "regex_replace", line_no)?;
+                Ok(Transform::RegexReplace {
+                    pattern: compile_regex(&source, line_no)?,
+                    replacement: expect_string(&args[1], "regex_replace", line_no)?,
+                })
+            }
+            "match" | "capture" => {
+                let first = args
+                    .first()
+                    .ok_or_else(|| format!("line {line_no}: match(pattern[, group]) needs an argument"))?;
+                let source = regex_pattern(first, "match", line_no)?;
+                let group = match args.get(1) {
+                    Some(value) => expect_usize(value, "match", line_no)?,
+                    None => 0,
+                };
+                Ok(Transform::RegexExtract {
+                    pattern: compile_regex(&source, line_no)?,
+                    group,
+                })
+            }
+            "regex_keep" | "keep" => {
+                let first = args
+                    .first()
+                    .ok_or_else(|| format!("line {line_no}: regex_keep(pattern) needs an argument"))?;
+                let source = regex_pattern(first, "regex_keep", line_no)?;
+                Ok(Transform::RegexKeep {
+                    pattern: compile_regex(&source, line_no)?,
+                })
+            }
+            "regex" => {
+                // Bare `regex("p")` as a transform extracts the whole match.
+                let first = args
+                    .first()
+                    .ok_or_else(|| format!("line {line_no}: regex(pattern) needs an argument"))?;
+                let source = regex_pattern(first, "regex", line_no)?;
+                Ok(Transform::RegexExtract {
+                    pattern: compile_regex(&source, line_no)?,
+                    group: 0,
                 })
             }
             "prefix" => Ok(Transform::Prefix(expect_string(
@@ -794,7 +898,7 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         assert_eq!(program.rules.len(), 2);
-        assert_eq!(program.defaults.separator, ";");
+        assert_eq!(program.defaults.separator, Separator::literal(";"));
         assert_eq!(program.rules[0].transform_left.len(), 2);
         assert!(matches!(program.rules[0].mapping, MappingSourceDef::Auto));
         match &program.rules[1].mapping {
@@ -839,6 +943,45 @@ mod tests {
             }
             _ => panic!("expected files mapping"),
         }
+    }
+
+    #[test]
+    fn parses_regex_constructs() {
+        let src = r#"
+            defaults {
+              separator = regex("\\s*[;,|]\\s*")
+            }
+            rule "r" {
+              left = a
+              transform_left = replace(regex("[^0-9]"), "") | match(regex("^(\\d+)"), 1)
+              pattern = "^[A-Z]{2}$"
+              compare = matches
+            }
+        "#;
+        let program = parse(src).unwrap();
+        assert!(matches!(program.defaults.separator, Separator::Regex(_)));
+        let rule = &program.rules[0];
+        assert_eq!(rule.transform_left.len(), 2);
+        assert!(matches!(rule.transform_left[0], Transform::RegexReplace { .. }));
+        assert!(matches!(
+            rule.transform_left[1],
+            Transform::RegexExtract { group: 1, .. }
+        ));
+        assert!(rule.pattern.is_some());
+        assert_eq!(rule.compare, Some(CompareOp::Matches));
+    }
+
+    #[test]
+    fn rejects_invalid_regex() {
+        let src = r#"
+            rule "r" {
+              left = a
+              right = b
+              transform_left = replace(regex("("), "")
+            }
+        "#;
+        let error = parse(src).unwrap_err();
+        assert!(error.contains("invalid regex"), "{error}");
     }
 
     #[test]

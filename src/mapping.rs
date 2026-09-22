@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use simd_csv::ByteRecord;
 
+use crate::pattern::Separator;
 use crate::rules::ColumnResolver;
 
 /// left value -> (target value -> number of observations)
@@ -89,17 +90,17 @@ pub fn merge_counts(into: &mut MapCounts, from: MapCounts) {
 
 /// Split a cell into tokens. When `multi` is false the whole value is a single
 /// token.
-pub fn split_tokens<'a>(value: &'a str, multi: bool, separator: &str) -> Vec<&'a str> {
+/// Split a cell into tokens. When `multi` is false the whole value is a single
+/// token. `separator` may be a literal string or a regex.
+pub fn split_tokens<'a>(value: &'a str, multi: bool, separator: &Separator) -> Vec<&'a str> {
     if !multi {
         return vec![value];
     }
-    if separator.is_empty() {
-        return vec![value];
-    }
-    value
-        .split(separator)
+    separator
+        .split(value)
+        .into_iter()
         .map(str::trim)
-        .filter(|t| !t.is_empty())
+        .filter(|token| !token.is_empty())
         .collect()
 }
 
@@ -125,7 +126,7 @@ pub struct FileMappingSpec<'a> {
     pub left_transforms: &'a [crate::transform::Transform],
     pub right_transforms: &'a [crate::transform::Transform],
     pub multi: bool,
-    pub value_separator: &'a str,
+    pub value_separator: &'a Separator,
     pub join_separator: &'a str,
     pub delimiter: u8,
 }
