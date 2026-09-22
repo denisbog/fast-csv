@@ -339,6 +339,49 @@ Run the bundled example:
 fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_id
 ```
 
+## GUI viewer (`fview`, optional)
+
+The crate also ships a second, **optional** binary that greps and browses rows
+of a big CSV file in a window. It depends on [`iced`](https://iced.rs) and
+[`rfd`](https://github.com/PolyMeilex/rfd) for the native file picker, both
+optional dependencies behind the `gui` feature, so the default `fvalidate`
+build stays GUI-free.
+
+```bash
+# Open empty, then use the "Open CSV…" button
+cargo run --release --features gui --bin fview
+
+# Or open a file directly
+cargo run --release --features gui --bin fview -- data.csv
+cargo run --release --features gui --bin fview -- data.csv -d '\t' --case-sensitive
+```
+
+The file path is optional. Without it the window opens on a welcome screen with
+an **Open CSV…** button that opens a native file picker; an **Open…** button in
+the top bar lets you switch files at any time. The top bar contains a text field
+for a regex filter (the filter is applied to every cell, case-insensitively by
+default; Enter or **Search** re-runs it on a background thread). Each matching
+row is rendered as a set of `attribute = value` chips. Every chip has a **mute**
+icon (an eye-slash, embedded from Bootstrap Icons via `iced_fonts`, so it does
+not depend on system fonts) that hides that attribute from all rows; hidden
+attributes appear as chips in the top bar, and clicking one (an eye icon plus
+the name) shows the attribute again. A **Hide all** button hides every
+attribute at once, so you can then reveal just the few you care about from the
+top bar; **show all** restores everything. Data rows use alternating background
+colors, and chips use a transparent background with a border, so they never
+blend into the plain or the striped row. Only the **first 100 matching rows**
+are shown (`-n/--limit` to change it), and scanning stops once that many are
+found, so large files stay responsive. Chips wrap onto as many lines as needed
+based on the window width (tracked via resize events), the hidden-attribute
+chips wrap too, and a very long value wraps inside its own chip, so a wide
+record never overflows or breaks the layout.
+
+Files:
+
+```
+src/bin/fview.rs   optional iced GUI (compiled only with --features gui)
+```
+
 ## Project layout
 
 ```
