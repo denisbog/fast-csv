@@ -55,6 +55,7 @@ pub struct RuleReport {
     pub rows_checked: u64,
     pub rows_passed: u64,
     pub rows_failed: u64,
+    pub rows_skipped: u64,
     pub transform_errors: u64,
     pub unmapped_values: u64,
     pub pass_examples: Vec<Example>,
@@ -109,10 +110,11 @@ impl Report {
             let _ = writeln!(out, "    right : {}", rule.right);
             let _ = writeln!(
                 out,
-                "    checked={} passed={} failed={} transform_errors={} unmapped_values={}",
+                "    checked={} passed={} failed={} skipped={} transform_errors={} unmapped_values={}",
                 rule.rows_checked,
                 rule.rows_passed,
                 rule.rows_failed,
+                rule.rows_skipped,
                 rule.transform_errors,
                 rule.unmapped_values
             );
@@ -235,11 +237,13 @@ impl Report {
                 "<div class=\"stats\"><span>checked <b>{}</b></span>\
                  <span class=\"pass\">passed <b>{}</b></span>\
                  <span class=\"fail\">failed <b>{}</b></span>\
+                 <span>skipped <b>{}</b></span>\
                  <span>transform errors <b>{}</b></span>\
                  <span>unmapped values <b>{}</b></span></div>",
                 rule.rows_checked,
                 rule.rows_passed,
                 rule.rows_failed,
+                rule.rows_skipped,
                 rule.transform_errors,
                 rule.unmapped_values,
             );

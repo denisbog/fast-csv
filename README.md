@@ -131,6 +131,8 @@ several lines as long as brackets/quotes balance.
 | `separator` | Token separator when `multi = true`; a plain string or `regex("...")`. |
 | `join_separator` | Glue used to combine several columns of one side into a single key (default `|`). |
 | `pattern` | Rule-level regex used by `compare = matches` / `not_matches`; `right` may then be omitted. |
+| `trim` | Trim each extracted cell (and reference-file cell) before transforming (default `false`). |
+| `allow_empty` (alias `optional`) | When `true`, a row whose source and target are both empty is **skipped** instead of failed (default `false`). |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
 | `mapping_left`, `mapping_right` | Column(s) inside the reference files; lists are allowed. |
@@ -138,7 +140,7 @@ several lines as long as brackets/quotes balance.
 | `report_limit` | Overrides `-n` for this rule. |
 
 Defaults can be set for `separator`, `multi`, `compare`, `report_limit`,
-`mapping_separator` and `join_separator`.
+`mapping_separator`, `join_separator`, `trim` and `allow_empty`.
 
 ### Validating a target that depends on two input values
 
@@ -267,7 +269,7 @@ machine-readable JSON (`--format json`) or as a **self-contained HTML page**
 HTML-escaped). For every rule
 it contains:
 
-* the number of rows checked, passed and failed;
+* the number of rows checked, passed, **skipped** and failed;
 * transform errors and unmapped values;
 * up to `N` **distinct** matching rows and `N` **distinct** failed rows, keyed
   by the unique id column (`-n` controls `N`; distinctness and a deterministic,
@@ -308,6 +310,35 @@ Rows checked    : 8
 
 A rule is marked `failed` when it has failing rows **or** an ambiguous mapping.
 
+### Optional values and trimming
+
+Real data often has optional fields. Two options make this pleasant:
+
+* `trim = true` strips surrounding whitespace from every extracted cell and
+  from reference-file values, so `" France "` is looked up as `"France"`.
+* `allow_empty = true` makes a relation **optional**: when the source and the
+  target are both empty (after trimming/transforms), the row is counted as
+  `skipped` rather than `failed`. For `pattern` rules (no target), an empty
+  value is skipped.
+
+```text
+rule "country code from reference (trim + optional)" {
+  left          = country_name
+  right         = country_code
+  trim          = true
+  allow_empty   = true
+  mapping_files = ["examples/country_codes.csv"]
+  mapping_left  = country_name
+  mapping_right = country_code
+}
+```
+
+Run the bundled example:
+
+```bash
+fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_id
+```
+
 ## Project layout
 
 ```
@@ -332,6 +363,9 @@ examples/
   rules_composite.vl   two-input-value example
   contacts.csv  regex fixture
   rules_regex.vl       regex example
+  members.csv   trim / optional-relation fixture
+  country_codes.csv
+  rules_optional.vl    trim + allow_empty example
 ```
 
 ## Tests

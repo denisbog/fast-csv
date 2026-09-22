@@ -65,6 +65,8 @@ pub struct CompiledRule {
     pub join_separator: String,
     /// Compiled regex for `compare = matches | not_matches`.
     pub pattern: Option<Regex>,
+    pub trim: bool,
+    pub allow_empty: bool,
     pub mapping: MappingPlan,
     pub report_limit: usize,
 }
@@ -109,6 +111,8 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             .join_separator
             .clone()
             .unwrap_or_else(|| program.defaults.join_separator.clone());
+        let trim = def.trim.unwrap_or(program.defaults.trim);
+        let allow_empty = def.allow_empty.unwrap_or(program.defaults.allow_empty);
 
         // `pattern` implies a regex comparison unless stated otherwise.
         let compare = match def.compare {
@@ -169,6 +173,8 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             separator,
             join_separator,
             pattern: def.pattern,
+            trim,
+            allow_empty,
             mapping,
             report_limit,
         });

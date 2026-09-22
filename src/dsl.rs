@@ -113,6 +113,11 @@ pub struct RuleDefaults {
     pub mapping_separator: Separator,
     /// Joins several columns into a single composite key.
     pub join_separator: String,
+    /// Trim every extracted cell (and mapping-file cell) before transforming.
+    pub trim: bool,
+    /// When true, a row whose source and target are both empty is skipped
+    /// instead of being reported as a failure (the relation is optional).
+    pub allow_empty: bool,
 }
 
 impl Default for RuleDefaults {
@@ -124,6 +129,8 @@ impl Default for RuleDefaults {
             report_limit: 10,
             mapping_separator: Separator::literal(","),
             join_separator: "|".to_string(),
+            trim: false,
+            allow_empty: false,
         }
     }
 }
@@ -143,6 +150,8 @@ pub struct RuleDef {
     pub join_separator: Option<String>,
     /// Rule-level regex used by `compare = matches | not_matches`.
     pub pattern: Option<Regex>,
+    pub trim: Option<bool>,
+    pub allow_empty: Option<bool>,
     pub mapping: MappingSourceDef,
     pub report_limit: Option<usize>,
 }
@@ -218,6 +227,8 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     separator: None,
                     join_separator: None,
                     pattern: None,
+                    trim: None,
+                    allow_empty: None,
                     mapping: MappingSourceDef::None,
                     report_limit: None,
                 });
@@ -301,6 +312,8 @@ fn apply_default(
         "report_limit" => defaults.report_limit = expect_usize(value, key, line_no)?,
         "mapping_separator" => defaults.mapping_separator = parse_separator(value, key, line_no)?,
         "join_separator" => defaults.join_separator = expect_string(value, key, line_no)?,
+        "trim" => defaults.trim = expect_bool(value, key, line_no)?,
+        "allow_empty" | "optional" => defaults.allow_empty = expect_bool(value, key, line_no)?,
         other => return Err(format!("line {line_no}: unknown defaults key `{other}`")),
     }
     Ok(())
@@ -327,6 +340,8 @@ fn apply_rule_key(
         "separator" => rule.separator = Some(parse_separator(value, key, line_no)?),
         "join_separator" => rule.join_separator = Some(expect_string(value, key, line_no)?),
         "pattern" => rule.pattern = Some(compile_pattern(value, key, line_no)?),
+        "trim" => rule.trim = Some(expect_bool(value, key, line_no)?),
+        "allow_empty" | "optional" => rule.allow_empty = Some(expect_bool(value, key, line_no)?),
         "report_limit" => rule.report_limit = Some(expect_usize(value, key, line_no)?),
         "mapping" => {
             let raw = expect_string_ref(value, key, line_no)?;

@@ -233,6 +233,38 @@ fn html_escapes_hostile_values() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `trim` and an optional relation (`allow_empty`): empty source/target pairs
+/// are skipped rather than failed.
+#[test]
+fn trim_and_optional_empty() {
+    let report = run_json(&[
+        &manifest("examples/members.csv"),
+        "-r",
+        &manifest("examples/rules_optional.vl"),
+        "--id-column",
+        "member_id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    assert_eq!(report["rows_checked"], 7);
+    let rules = report["rules"].as_array().unwrap();
+
+    // trim = true + allow_empty = true: padded values are recognized and the
+    // empty/whitespace-only rows are skipped, so the rule passes.
+    assert_eq!(rules[0]["status"], "passed");
+    assert_eq!(rules[0]["rows_passed"], 5);
+    assert_eq!(rules[0]["rows_failed"], 0);
+    assert_eq!(rules[0]["rows_skipped"], 2);
+
+    // Without trim the padded values are unmapped and fail; the truly empty
+    // pair is still skipped by allow_empty.
+    assert_eq!(rules[1]["rows_failed"], 2);
+    assert_eq!(rules[1]["rows_skipped"], 1);
+    assert_eq!(rules[1]["unmapped_values"], 2);
+}
+
 /// xan-style regex: `regex(...)` in transforms, a rule `pattern`, and a
 /// regex separator.
 #[test]

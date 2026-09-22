@@ -111,6 +111,7 @@ struct RuleAccum {
     checked: u64,
     passed: u64,
     failed: u64,
+    skipped: u64,
     transform_errors: u64,
     unmapped: u64,
     pass_samples: Sampler<Example>,
@@ -126,6 +127,7 @@ impl RuleAccum {
             checked: 0,
             passed: 0,
             failed: 0,
+            skipped: 0,
             transform_errors: 0,
             unmapped: 0,
             pass_samples: Sampler::new(limit),
@@ -138,6 +140,7 @@ impl RuleAccum {
         self.checked += other.checked;
         self.passed += other.passed;
         self.failed += other.failed;
+        self.skipped += other.skipped;
         self.transform_errors += other.transform_errors;
         self.unmapped += other.unmapped;
         self.pass_samples.merge(other.pass_samples);
@@ -258,6 +261,7 @@ fn build_counts_segment(
                 left_slots.iter().map(|&slot| cells[slot].as_str()),
                 &rule.transform_left,
                 &rule.join_separator,
+                rule.trim,
                 &mut component_buf,
                 &mut left_buf,
             );
@@ -265,6 +269,7 @@ fn build_counts_segment(
                 right_slots.iter().map(|&slot| cells[slot].as_str()),
                 &rule.transform_right,
                 &rule.join_separator,
+                rule.trim,
                 &mut component_buf,
                 &mut right_buf,
             );
@@ -337,6 +342,7 @@ fn validate_segment(
                 left_slots.iter().map(|&slot| cells[slot].as_str()),
                 &rule.transform_left,
                 &rule.join_separator,
+                rule.trim,
                 &mut component_buf,
                 &mut left_buf,
             );
@@ -344,9 +350,22 @@ fn validate_segment(
                 right_slots.iter().map(|&slot| cells[slot].as_str()),
                 &rule.transform_right,
                 &rule.join_separator,
+                rule.trim,
                 &mut component_buf,
                 &mut right_buf,
             );
+            // Optional relation: when both the source and the target are empty
+            // the row is skipped instead of being reported as a failure. For
+            // pattern rules there is no target, so an empty value is skipped.
+            if rule.allow_empty
+                && left_buf.is_empty()
+                && (rule.pattern.is_some() || right_buf.is_empty())
+            {
+                accum.checked += 1;
+                accum.skipped += 1;
+                continue;
+            }
+
             // Regex rules only need the left value: the rule-level pattern
             // decides the outcome, mirroring xan's `match(value, regex(...))`.
             let id = match slots.id_slot {
@@ -382,7 +401,9 @@ fn validate_segment(
                             Some(target) => expected_buf.push(target.to_string()),
                             None => {
                                 accum.unmapped += 1;
-                                expected_buf.push(format!("\u{0}unmapped:{token}"));
+                                // `\u{0}` cannot appear in a real target, so
+                                // this sentinel can never accidentally match.
+                                expected_buf.push(format!("\u{0}{token}"));
                             }
                         }
 
@@ -456,7 +477,16 @@ fn validate_segment(
 }
 
 fn mapping_expected(mapping: Option<&Mapping>, expected: &[String]) -> Option<String> {
-    mapping.map(|_| expected.join(", "))
+    mapping.map(|_| {
+        expected
+            .iter()
+            .map(|value| match value.strip_prefix('\u{0}') {
+                Some(unmapped) => format!("<unmapped:{unmapped}>"),
+                None => value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +528,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                     multi: *multi,
                     value_separator: separator,
                     join_separator: &rule.join_separator,
+                    trim: rule.trim,
                     delimiter: config.delimiter,
                 },
             )
@@ -617,6 +648,7 @@ fn build_report(
             rows_checked: accum.checked,
             rows_passed: accum.passed,
             rows_failed: accum.failed,
+            rows_skipped: accum.skipped,
             transform_errors: accum.transform_errors,
             unmapped_values: accum.unmapped,
             pass_examples: accum.pass_samples.payloads(),

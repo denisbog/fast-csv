@@ -128,6 +128,7 @@ pub struct FileMappingSpec<'a> {
     pub multi: bool,
     pub value_separator: &'a Separator,
     pub join_separator: &'a str,
+    pub trim: bool,
     pub delimiter: u8,
 }
 
@@ -203,6 +204,7 @@ pub fn load_from_files(files: &[PathBuf], spec: &FileMappingSpec) -> Result<Mapp
                     .map(|&i| String::from_utf8_lossy(record.get(i).unwrap_or(b""))),
                 spec.left_transforms,
                 spec.join_separator,
+                spec.trim,
                 &mut left_scratch,
                 &mut left_key,
             );
@@ -212,6 +214,7 @@ pub fn load_from_files(files: &[PathBuf], spec: &FileMappingSpec) -> Result<Mapp
                     .map(|&i| String::from_utf8_lossy(record.get(i).unwrap_or(b""))),
                 spec.right_transforms,
                 spec.join_separator,
+                spec.trim,
                 &mut right_scratch,
                 &mut right_key,
             );

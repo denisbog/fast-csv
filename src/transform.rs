@@ -205,13 +205,15 @@ pub fn apply_pipeline(transforms: &[Transform], input: &str, out: &mut String) -
 
 /// Combine several already-extracted cell values into one composite key.
 ///
-/// Each part runs through `transforms` independently, then the results are
-/// joined with `join`. `scratch` is reused between parts, so no allocation is
-/// needed once it is warm, and the final key is written to `out`.
+/// Each part is optionally trimmed, then runs through `transforms`
+/// independently, then the results are joined with `join`. `scratch` is reused
+/// between parts, so no allocation is needed once it is warm, and the final key
+/// is written to `out`.
 pub fn compose<S, I>(
     parts: I,
     transforms: &[Transform],
     join: &str,
+    trim: bool,
     scratch: &mut String,
     out: &mut String,
 ) -> bool
@@ -225,7 +227,9 @@ where
         if index > 0 {
             out.push_str(join);
         }
-        ok &= apply_pipeline(transforms, part.as_ref(), scratch);
+        let part = part.as_ref();
+        let part = if trim { part.trim() } else { part };
+        ok &= apply_pipeline(transforms, part, scratch);
         out.push_str(scratch);
     }
     ok
@@ -371,10 +375,23 @@ mod tests {
             [" Widget ", "EU"],
             &transforms,
             "|",
+            true,
             &mut scratch,
             &mut out,
         );
         assert!(ok);
         assert_eq!(out, "widget|eu");
+
+        // Without trimming, surrounding whitespace is preserved.
+        let mut untrimmed = String::new();
+        compose(
+            [" Widget ", "EU"],
+            &[] as &[Transform],
+            "|",
+            false,
+            &mut scratch,
+            &mut untrimmed,
+        );
+        assert_eq!(untrimmed, " Widget |EU");
     }
 }
