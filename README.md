@@ -371,10 +371,13 @@ top bar; **show all** restores everything. Data rows use alternating background
 colors, and chips use a transparent background with a border, so they never
 blend into the plain or the striped row. Only the **first 100 matching rows**
 are shown (`-n/--limit` to change it), and scanning stops once that many are
-found, so large files stay responsive. Chips wrap onto as many lines as needed
-based on the window width (tracked via resize events), the hidden-attribute
-chips wrap too, and a very long value wraps inside its own chip, so a wide
-record never overflows or breaks the layout.
+found, so large files stay responsive. Chips wrap based on the window width
+(tracked via resize events) and the hidden-attribute chips wrap too. The row
+list is **virtualized**: only the stripes intersecting the viewport (plus a
+small overscan) are built each frame, so scrolling stays smooth no matter how
+large `-n` is. To keep the virtual offsets exact, every stripe has the same
+fixed height and a chip shows at most two wrapped lines (longer values are
+clipped); each stripe's background alternates for readability.
 
 ### Large attribute lists, search and profiles
 

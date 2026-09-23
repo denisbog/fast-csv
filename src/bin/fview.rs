@@ -32,9 +32,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, Row,
+    button, column, container, pick_list, row, scrollable, text, text_input, Row, Space,
 };
 use iced::{Background, Border, Center, Element, Fill, Length, Subscription, Task, Theme};
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
@@ -47,6 +48,20 @@ const BUFFER_CAPACITY: usize = 64 * 1024;
 const CHIP_SPACING: f32 = 8.0;
 /// Non-text width of a chip: padding + mute icon + inner spacing.
 const CHIP_CHROME: f32 = 48.0;
+/// Non-text height of a chip: vertical padding + border.
+const CHIP_CHROME_V: f32 = 8.0;
+/// Height of a single line of chip text.
+const CHIP_LINE_HEIGHT: f32 = 16.0;
+/// A chip may wrap to at most this many lines; longer values are clipped.
+/// Capping the height is what lets every data stripe have a fixed height, which
+/// in turn makes the virtual scrolling below exact.
+const MAX_CHIP_LINES: usize = 2;
+/// Vertical padding of a data stripe (kept in sync with `container.padding`).
+const STRIPE_PADDING: f32 = 8.0;
+/// Spacing between the chip lines inside a stripe.
+const CHIP_LINE_SPACING: f32 = 6.0;
+/// Rows rendered above and below the viewport so scrolling does not flash gaps.
+const OVERSCAN_ROWS: usize = 3;
 /// Preferred chip width used to decide how many chips fit on a line.
 const TARGET_CHIP_WIDTH: f32 = 280.0;
 /// Rough width of one character at size 13, used to decide text wrapping.
@@ -130,6 +145,34 @@ fn attr_matches(filter: &str, name: &str) -> bool {
     !filter.is_empty() && name.to_lowercase().contains(&filter.to_lowercase())
 }
 
+/// Layout geometry derived from the window width: chips per line, the maximum
+/// chip width, and how many hidden-attribute chips fit on a line.
+fn chip_layout(width: f32) -> (usize, f32, usize) {
+    let available = (width - 28.0).max(200.0);
+    let columns = ((available / TARGET_CHIP_WIDTH).floor() as usize).max(1);
+    let chip_max = ((available - (columns.saturating_sub(1) as f32) * CHIP_SPACING)
+        / columns as f32)
+        .max(120.0);
+    let hidden_columns = ((available / 170.0).floor() as usize).max(1);
+    (columns, chip_max, hidden_columns)
+}
+
+/// Height reserved for one line of chips, tall enough for the maximum number
+/// of wrapped lines a chip may show.
+fn chip_line_box() -> f32 {
+    MAX_CHIP_LINES as f32 * CHIP_LINE_HEIGHT + CHIP_CHROME_V
+}
+
+/// Fixed height of a data stripe showing `lines` lines of chips. Used both to
+/// place rows and to give each stripe exactly that height, keeping virtual
+/// scrolling stable.
+fn stripe_height(lines: usize) -> f32 {
+    let lines = lines.max(1);
+    lines as f32 * chip_line_box()
+        + (lines - 1) as f32 * CHIP_LINE_SPACING
+        + 2.0 * STRIPE_PADDING
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     OpenFile,
@@ -159,8 +202,10 @@ enum Message {
     CancelSaveNewProfile,
     /// `(generation, result)`; stale generations are ignored.
     ScanFinished(u64, Result<ScanResult, String>),
-    /// The window was resized; used to wrap chips onto several lines.
-    Resized(f32),
+    /// The window was resized; used to wrap chips and to size the virtual list.
+    Resized(f32, f32),
+    /// The scroll position changed; drives the virtual row window.
+    Scrolled(scrollable::Viewport),
 }
 
 struct Viewer {
@@ -178,6 +223,12 @@ struct Viewer {
     dirty: bool,
     generation: u64,
     window_width: f32,
+    /// Stable id of the row scrollable, so the view can jump back to the top.
+    scroll_id: scrollable::Id,
+    /// Vertical scroll offset of the row list, in px.
+    scroll_offset: f32,
+    /// Height of the row viewport, in px.
+    viewport_height: f32,
     /// Attribute search: highlights matching chips in the main view and narrows
     /// the hidden attribute list to the matching names.
     attribute_filter: String,
@@ -211,6 +262,9 @@ impl Viewer {
             dirty: false,
             generation: 0,
             window_width: 1200.0,
+            scroll_id: scrollable::Id::unique(),
+            scroll_offset: 0.0,
+            viewport_height: 720.0,
             attribute_filter: String::new(),
             profiles: load_config().profiles,
             current_profile: None,
@@ -434,10 +488,23 @@ impl Viewer {
                 self.profile_status = None;
                 Task::none()
             }
-            Message::Resized(width) => {
-                if (self.window_width - width).abs() > 0.5 {
+            Message::Resized(width, height) => {
+                // Keep the virtual viewport fresh so a taller window renders more
+                // rows without waiting for the next scroll event.
+                self.viewport_height = height.max(1.0);
+                // Only rebuild the chip layout when the number of chips per line
+                // actually changes; resize events fire continuously while a
+                // window edge is dragged.
+                let (old_columns, _, old_hidden) = chip_layout(self.window_width);
+                let (new_columns, _, new_hidden) = chip_layout(width);
+                if old_columns != new_columns || old_hidden != new_hidden {
                     self.window_width = width;
                 }
+                Task::none()
+            }
+            Message::Scrolled(viewport) => {
+                self.scroll_offset = viewport.absolute_offset().y;
+                self.viewport_height = viewport.bounds().height.max(1.0);
                 Task::none()
             }
             Message::ScanFinished(generation, result) => {
@@ -453,18 +520,25 @@ impl Viewer {
                     Err(message) => self.error = Some(message),
                 }
                 self.scanning = false;
+                self.scroll_offset = 0.0;
+                // Jump the row list back to the top for the new result set.
+                let reset = scrollable::scroll_to(
+                    self.scroll_id.clone(),
+                    AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
                 if self.dirty {
                     self.dirty = false;
-                    self.start_scan()
+                    Task::batch([reset, self.start_scan()])
                 } else {
-                    Task::none()
+                    reset
                 }
             }
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::window::resize_events().map(|(_id, size)| Message::Resized(size.width))
+        iced::window::resize_events()
+            .map(|(_id, size)| Message::Resized(size.width, size.height))
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -568,13 +642,7 @@ impl Viewer {
         .padding(10);
 
         // Hidden attributes live in the top bar; clicking restores them.
-        let available = (self.window_width - 28.0).max(200.0);
-        let columns = ((available / TARGET_CHIP_WIDTH).floor() as usize).max(1);
-        let chip_max = ((available - (columns.saturating_sub(1) as f32) * CHIP_SPACING)
-            / columns as f32)
-            .max(120.0);
-        // Hidden attribute chips are narrow, so more of them fit per line.
-        let hidden_columns = ((available / 170.0).floor() as usize).max(1);
+        let (columns, chip_max, hidden_columns) = chip_layout(self.window_width);
 
         let mut hidden_bar = column![].spacing(4).padding([4, 10]);
         let mut controls = Row::new().spacing(6).align_y(Center);
@@ -747,38 +815,85 @@ impl Viewer {
                 .padding(12),
             );
         } else {
-            // One record per stripe, with wrapping chips and alternating colors.
-            let mut striped = false;
-            for values in &self.rows {
+            // Virtual scrolling: only the stripes intersecting the viewport (plus
+            // a small overscan) are built, so a long list costs the same per frame
+            // as a short one. Every stripe is given the same fixed height, which
+            // keeps the computed offsets exact.
+            let visible_headers = self
+                .headers
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !self.muted.contains(index))
+                .count();
+            let line_count = visible_headers.div_ceil(columns).max(1);
+            let row_height = stripe_height(line_count);
+            let total_rows = self.rows.len();
+            let viewport = self.viewport_height.max(1.0);
+
+            let first = ((self.scroll_offset / row_height).floor() as usize)
+                .saturating_sub(OVERSCAN_ROWS)
+                .min(total_rows);
+            let last = ((((self.scroll_offset + viewport) / row_height).ceil() as usize)
+                + OVERSCAN_ROWS
+                + 1)
+                .min(total_rows)
+                .max(first);
+
+            if first > 0 {
+                list = list.push(Space::with_height(Length::Fixed(
+                    first as f32 * row_height,
+                )));
+            }
+
+            for (position, values) in self.rows[first..last].iter().enumerate() {
+                let index = first + position;
                 let visible: Vec<usize> = (0..values.len())
-                    .filter(|index| !self.muted.contains(index))
+                    .filter(|column| !self.muted.contains(column))
                     .collect();
-                if visible.is_empty() {
-                    continue;
-                }
-                let mut block = column![].spacing(6);
+                let mut block = column![].spacing(CHIP_LINE_SPACING);
                 for chunk in visible.chunks(columns) {
                     let mut line = Row::new().spacing(CHIP_SPACING);
-                    for &index in chunk {
-                        let header = self.headers.get(index).map(String::as_str).unwrap_or("?");
+                    for &column in chunk {
+                        let header = self.headers.get(column).map(String::as_str).unwrap_or("?");
                         let highlight = attr_matches(&self.attribute_filter, header);
-                        line = line.push(chip(header, &values[index], index, chip_max, highlight));
+                        line = line.push(chip(header, &values[column], column, chip_max, highlight));
                     }
-                    block = block.push(line);
+                    // Clip each chip line to a fixed height so a very long value
+                    // cannot make one stripe taller than the rest.
+                    block = block.push(
+                        container(line)
+                            .height(Length::Fixed(chip_line_box()))
+                            .clip(true),
+                    );
                 }
                 list = list.push(
                     container(block)
                         .width(Fill)
-                        .padding([8, 12])
-                        .style(stripe_style(striped)),
+                        .height(Length::Fixed(row_height))
+                        .clip(true)
+                        .padding([STRIPE_PADDING, 12.0])
+                        .style(stripe_style(index % 2 == 1)),
                 );
-                striped = !striped;
+            }
+
+            if last < total_rows {
+                list = list.push(Space::with_height(Length::Fixed(
+                    (total_rows - last) as f32 * row_height,
+                )));
             }
         }
 
-        column![top, hidden_bar, scrollable(list).height(Fill).width(Fill)]
-            .spacing(0)
-            .into()
+        column![
+            top,
+            hidden_bar,
+            scrollable(list)
+                .id(self.scroll_id.clone())
+                .on_scroll(Message::Scrolled)
+                .height(Fill)
+                .width(Fill)
+        ]
+        .spacing(0)
+        .into()
     }
 }
 
@@ -993,5 +1108,27 @@ mod tests {
         assert!(!attr_matches("", "full_name"));
         assert!(!attr_matches("   ", "full_name"));
         assert!(!attr_matches("age", "full_name"));
+    }
+
+    #[test]
+    fn stripe_height_grows_with_line_count() {
+        // Virtual offsets rely on a stable, positive height.
+        assert!(stripe_height(1) > 0.0);
+        assert!(stripe_height(3) > stripe_height(2));
+        assert!(stripe_height(2) > stripe_height(1));
+        // Degenerate input must not collapse to zero height.
+        assert_eq!(stripe_height(0), stripe_height(1));
+    }
+
+    #[test]
+    fn chip_layout_is_always_usable() {
+        for width in [0.0, 100.0, 600.0, 1200.0, 4000.0] {
+            let (columns, chip_max, hidden_columns) = chip_layout(width);
+            assert!(columns >= 1);
+            assert!(hidden_columns >= 1);
+            assert!(chip_max >= 120.0);
+        }
+        // A wider window fits at least as many chips per line.
+        assert!(chip_layout(2400.0).0 >= chip_layout(800.0).0);
     }
 }
