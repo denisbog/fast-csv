@@ -347,6 +347,12 @@ of a big CSV file in a window. It depends on [`iced`](https://iced.rs) and
 `toml` and `dirs` for the profile store), all optional dependencies behind the
 `gui` feature, so the default `fvalidate` build stays GUI-free.
 
+The viewer is **GPU-accelerated** by default: iced is built with both the
+`wgpu` (GPU) and `tiny-skia` (CPU) renderers, and picks `wgpu` first, falling
+back to `tiny-skia` when no usable GPU/adapter is found. Use `--backend` to
+force one (`auto`, `wgpu`, or `tiny-skia`). With `wgpu` the GPU API itself can
+be restricted through the usual wgpu variables (e.g. `WGPU_BACKEND=vulkan`).
+
 ```bash
 # Open empty, then use the "Open CSV…" button
 cargo run --release --features gui --bin fview
@@ -354,6 +360,9 @@ cargo run --release --features gui --bin fview
 # Or open a file directly
 cargo run --release --features gui --bin fview -- data.csv
 cargo run --release --features gui --bin fview -- data.csv -d '\t' --case-sensitive
+
+# Force a rendering backend (default: auto → wgpu, then tiny-skia)
+cargo run --release --features gui --bin fview -- data.csv --backend tiny-skia
 ```
 
 The file path is optional. Without it the window opens on a welcome screen with
@@ -367,11 +376,19 @@ not depend on system fonts) that hides that attribute from all rows; hidden
 attributes appear as chips in the top bar, and clicking one (an eye icon plus
 the name) shows the attribute again. A **Hide all** button hides every
 attribute at once, so you can then reveal just the few you care about from the
-top bar; **show all** restores everything. Data rows use alternating background
-colors, and chips use a transparent background with a border, so they never
+top bar; **show all** restores everything. The hidden-attribute list is
+**collapsible** (a **Hidden (N)** button with a caret toggles it), so a long
+list never pushes the rows off screen; when collapsed a note reports how many
+hidden attributes are available, and typing in the **Attributes:** search box
+automatically reveals the matching hidden names. Data rows use alternating
+background colors, and chips use a transparent background with a border, so
+they never
 blend into the plain or the striped row. Only the **first 100 matching rows**
 are shown (`-n/--limit` to change it), and scanning stops once that many are
-found, so large files stay responsive. Chips wrap based on the window width
+found, so large files stay responsive. The status line reports how many rows
+were read, and, once the whole file has been read, the total row count (e.g.
+`7 matching rows of 500 total`, or just `500 rows` when every read row
+matched). Chips wrap based on the window width
 (tracked via resize events) and the hidden-attribute chips wrap too. The row
 list is **virtualized**: only the stripes intersecting the viewport (plus a
 small overscan) are built each frame, so scrolling stays smooth no matter how

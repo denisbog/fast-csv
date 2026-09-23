@@ -31,11 +31,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, Row, Space,
+    button, column, container, horizontal_rule, pick_list, row, scrollable, text, text_input, Row,
+    Space,
 };
 use iced::{Background, Border, Center, Element, Fill, Length, Subscription, Task, Theme};
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
@@ -84,12 +85,31 @@ struct Args {
     /// Maximum number of matching rows to display (default 100).
     #[arg(short = 'n', long, default_value_t = 100)]
     limit: usize,
+
+    /// Rendering backend. `auto` prefers the GPU (wgpu) and falls back to the
+    /// CPU renderer (tiny-skia) when no GPU is available; the other values
+    /// force a specific backend.
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// Prefer the GPU, fall back to the CPU renderer.
+    Auto,
+    /// Force the wgpu (GPU) renderer.
+    Wgpu,
+    /// Force the tiny-skia (CPU) renderer.
+    TinySkia,
 }
 
 #[derive(Debug, Clone)]
 struct ScanResult {
     rows: Vec<Vec<String>>,
     truncated: bool,
+    /// Number of data rows actually read from the file. When `truncated` is
+    /// false this is the total number of rows in the file.
+    rows_read: usize,
 }
 
 /// A named set of visible attributes.
@@ -145,6 +165,30 @@ fn attr_matches(filter: &str, name: &str) -> bool {
     !filter.is_empty() && name.to_lowercase().contains(&filter.to_lowercase())
 }
 
+/// Note shown when the hidden-attribute list is collapsed, so the count stays
+/// visible without spending vertical space on the chips.
+fn hidden_note(count: usize) -> String {
+    match count {
+        1 => "1 hidden attribute available — use the Hidden button to reveal it".to_string(),
+        _ => format!(
+            "{count} hidden attributes available — use the Hidden button to reveal them"
+        ),
+    }
+}
+
+/// Status line for the current scan. `rows_read` is the number of data rows
+/// read; when the scan was not truncated it is the total number of rows in the
+/// file.
+fn status_text(matched: usize, rows_read: usize, truncated: bool) -> String {
+    if truncated {
+        format!("showing first {matched} matching rows (more available) · {rows_read} rows read")
+    } else if matched == rows_read {
+        format!("{rows_read} rows")
+    } else {
+        format!("{matched} matching rows of {rows_read} total")
+    }
+}
+
 /// Layout geometry derived from the window width: chips per line, the maximum
 /// chip width, and how many hidden-attribute chips fit on a line.
 fn chip_layout(width: f32) -> (usize, f32, usize) {
@@ -186,6 +230,8 @@ enum Message {
     UnmuteAll,
     /// Hide every attribute at once, so a few can be picked back.
     MuteAll,
+    /// Expand or collapse the list of hidden attribute chips.
+    ToggleHidden,
     /// The attribute search box changed: highlight matching chips and narrow
     /// the hidden attribute list.
     AttributeFilterChanged(String),
@@ -215,9 +261,13 @@ struct Viewer {
     limit: usize,
     headers: Vec<String>,
     muted: HashSet<usize>,
+    /// Whether the list of hidden attribute chips in the top bar is expanded.
+    show_hidden: bool,
     filter: String,
     rows: Vec<Vec<String>>,
     truncated: bool,
+    /// Number of data rows read by the last completed scan.
+    rows_read: usize,
     error: Option<String>,
     scanning: bool,
     dirty: bool,
@@ -254,9 +304,11 @@ impl Viewer {
             limit: args.limit.max(1),
             headers: Vec::new(),
             muted: HashSet::new(),
+            show_hidden: false,
             filter: String::new(),
             rows: Vec::new(),
             truncated: false,
+            rows_read: 0,
             error: None,
             scanning: false,
             dirty: false,
@@ -303,7 +355,9 @@ impl Viewer {
         self.dirty = false;
         self.rows.clear();
         self.truncated = false;
+        self.rows_read = 0;
         self.muted.clear();
+        self.show_hidden = false;
         self.error = None;
         self.current_profile = None;
         self.naming_profile = false;
@@ -451,6 +505,10 @@ impl Viewer {
                 self.profile_status = None;
                 Task::none()
             }
+            Message::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                Task::none()
+            }
             Message::AttributeFilterChanged(value) => {
                 self.attribute_filter = value;
                 Task::none()
@@ -515,6 +573,7 @@ impl Viewer {
                     Ok(scan) => {
                         self.rows = scan.rows;
                         self.truncated = scan.truncated;
+                        self.rows_read = scan.rows_read;
                         self.error = None;
                     }
                     Err(message) => self.error = Some(message),
@@ -619,14 +678,8 @@ impl Viewer {
             .into()
         } else if self.scanning {
             text("scanning…").into()
-        } else if self.truncated {
-            text(format!(
-                "showing first {} matching rows (more available)",
-                self.rows.len()
-            ))
-            .into()
         } else {
-            text(format!("{} matching rows", self.rows.len())).into()
+            text(status_text(self.rows.len(), self.rows_read, self.truncated)).into()
         };
 
         let top = row![
@@ -662,7 +715,26 @@ impl Viewer {
             .style(button::secondary),
         );
         if !self.muted.is_empty() {
-            controls = controls.push(text("Hidden:").size(13));
+            // Collapsible list of hidden attributes: long lists would otherwise
+            // push the data rows off screen.
+            let caret = if self.show_hidden {
+                Bootstrap::CaretDown
+            } else {
+                Bootstrap::CaretRight
+            };
+            controls = controls.push(
+                button(
+                    row![
+                        text(char::from(caret)).font(BOOTSTRAP_FONT).size(13),
+                        text(format!("Hidden ({})", self.muted.len())).size(13),
+                    ]
+                    .spacing(5)
+                    .align_y(Center),
+                )
+                .on_press(Message::ToggleHidden)
+                .padding([3, 8])
+                .style(button::secondary),
+            );
             controls = controls.push(
                 button(text("show all").size(13))
                     .on_press(Message::UnmuteAll)
@@ -745,55 +817,61 @@ impl Viewer {
             );
         }
 
-        // The hidden attribute names wrap onto several lines, sorted
-        // alphabetically so a large attribute list stays easy to scan. When
-        // the attribute filter is non-empty only matching names are shown.
+        // The hidden attribute names are sorted alphabetically so a large
+        // attribute list stays easy to scan. The list is collapsed by default
+        // (a long list would otherwise push the rows off screen); it opens when
+        // the user toggles it or searches for an attribute. When collapsed only
+        // a note with the count is shown.
         if !self.muted.is_empty() {
-            let mut indices: Vec<usize> = self.muted.iter().copied().collect();
-            indices.sort_by(|a, b| {
-                let left = self.headers.get(*a).map(String::as_str).unwrap_or("");
-                let right = self.headers.get(*b).map(String::as_str).unwrap_or("");
-                left.to_lowercase()
-                    .cmp(&right.to_lowercase())
-                    .then_with(|| a.cmp(b))
-            });
-            let filtering = !self.attribute_filter.trim().is_empty();
-            let mut line = Row::new().spacing(6).align_y(Center);
-            let mut count = 0usize;
-            let mut shown = 0usize;
-            for index in indices {
-                let Some(name) = self.headers.get(index) else {
-                    continue;
-                };
-                if filtering && !attr_matches(&self.attribute_filter, name) {
-                    continue;
-                }
-                if count == hidden_columns {
-                    hidden_bar = hidden_bar.push(line);
-                    line = Row::new().spacing(6).align_y(Center);
-                    count = 0;
-                }
-                line = line.push(
-                    button(
-                        row![
-                            text(char::from(Bootstrap::Eye)).font(BOOTSTRAP_FONT).size(13),
-                            text(name).size(13),
-                        ]
-                        .spacing(5)
-                        .align_y(Center),
-                    )
-                    .on_press(Message::Unmute(index))
-                    .padding([3, 8])
-                    .style(button::secondary),
-                );
-                count += 1;
-                shown += 1;
-            }
-            if shown > 0 {
-                hidden_bar = hidden_bar.push(line);
+            let searching = !self.attribute_filter.trim().is_empty();
+            if !self.show_hidden && !searching {
+                hidden_bar = hidden_bar.push(text(hidden_note(self.muted.len())).size(13));
             } else {
-                hidden_bar =
-                    hidden_bar.push(text("no hidden attributes match the filter").size(13));
+                let mut indices: Vec<usize> = self.muted.iter().copied().collect();
+                indices.sort_by(|a, b| {
+                    let left = self.headers.get(*a).map(String::as_str).unwrap_or("");
+                    let right = self.headers.get(*b).map(String::as_str).unwrap_or("");
+                    left.to_lowercase()
+                        .cmp(&right.to_lowercase())
+                        .then_with(|| a.cmp(b))
+                });
+                let mut line = Row::new().spacing(6).align_y(Center);
+                let mut count = 0usize;
+                let mut shown = 0usize;
+                for index in indices {
+                    let Some(name) = self.headers.get(index) else {
+                        continue;
+                    };
+                    if searching && !attr_matches(&self.attribute_filter, name) {
+                        continue;
+                    }
+                    if count == hidden_columns {
+                        hidden_bar = hidden_bar.push(line);
+                        line = Row::new().spacing(6).align_y(Center);
+                        count = 0;
+                    }
+                    line = line.push(
+                        button(
+                            row![
+                                text(char::from(Bootstrap::Eye)).font(BOOTSTRAP_FONT).size(13),
+                                text(name).size(13),
+                            ]
+                            .spacing(5)
+                            .align_y(Center),
+                        )
+                        .on_press(Message::Unmute(index))
+                        .padding([3, 8])
+                        .style(button::secondary),
+                    );
+                    count += 1;
+                    shown += 1;
+                }
+                if shown > 0 {
+                    hidden_bar = hidden_bar.push(line);
+                } else {
+                    hidden_bar =
+                        hidden_bar.push(text("no hidden attributes match the filter").size(13));
+                }
             }
         }
 
@@ -810,7 +888,8 @@ impl Viewer {
         } else if all_hidden {
             list = list.push(
                 container(
-                    text("All attributes hidden — click an attribute above to display it.").size(14),
+                    text("All attributes hidden — reveal the Hidden list above, then click an attribute to display it.")
+                        .size(14),
                 )
                 .padding(12),
             );
@@ -886,6 +965,7 @@ impl Viewer {
         column![
             top,
             hidden_bar,
+            horizontal_rule(1).style(divider_style),
             scrollable(list)
                 .id(self.scroll_id.clone())
                 .on_scroll(Message::Scrolled)
@@ -894,6 +974,19 @@ impl Viewer {
         ]
         .spacing(0)
         .into()
+    }
+}
+
+/// Divider between the toolbar and the rows. Uses the theme's text color so it
+/// stays distinct from both the plain and the striped (`background.weak`) row
+/// backgrounds that the default `Rule` color blends into.
+fn divider_style(theme: &Theme) -> iced::widget::rule::Style {
+    let palette = theme.extended_palette();
+    iced::widget::rule::Style {
+        color: palette.background.base.text,
+        width: 1,
+        radius: 0.0.into(),
+        fill_mode: iced::widget::rule::FillMode::Full,
     }
 }
 
@@ -1024,6 +1117,7 @@ fn scan(
     let mut record = ByteRecord::new();
     let mut rows = Vec::new();
     let mut truncated = false;
+    let mut rows_read = 0usize;
 
     loop {
         match reader.read_byte_record(&mut record) {
@@ -1031,6 +1125,7 @@ fn scan(
             Ok(true) => {}
             Err(e) => return Err(format!("error reading {}: {e}", path.display())),
         }
+        rows_read += 1;
 
         let is_match = match &regex {
             None => true,
@@ -1055,7 +1150,11 @@ fn scan(
         }
     }
 
-    Ok(ScanResult { rows, truncated })
+    Ok(ScanResult {
+        rows,
+        truncated,
+        rows_read,
+    })
 }
 
 fn parse_delimiter(raw: &str) -> Result<u8, String> {
@@ -1074,6 +1173,14 @@ fn parse_delimiter(raw: &str) -> Result<u8, String> {
 
 fn main() -> iced::Result {
     let args = Args::parse();
+
+    // iced selects the compositor from `ICED_BACKEND` (or automatically when it
+    // is unset, which is `wgpu` followed by `tiny-skia`).
+    match args.backend {
+        Backend::Auto => {}
+        Backend::Wgpu => std::env::set_var("ICED_BACKEND", "wgpu"),
+        Backend::TinySkia => std::env::set_var("ICED_BACKEND", "tiny-skia"),
+    }
 
     iced::application("fview — CSV viewer", Viewer::update, Viewer::view)
         .subscription(Viewer::subscription)
@@ -1108,6 +1215,43 @@ mod tests {
         assert!(!attr_matches("", "full_name"));
         assert!(!attr_matches("   ", "full_name"));
         assert!(!attr_matches("age", "full_name"));
+    }
+
+    #[test]
+    fn hidden_note_pluralizes() {
+        assert_eq!(hidden_note(1).matches("attribute").count(), 1);
+        assert!(hidden_note(1).contains("1 hidden attribute available"));
+        assert!(hidden_note(42).contains("42 hidden attributes available"));
+    }
+
+    #[test]
+    fn status_text_reports_rows_read() {
+        assert_eq!(
+            status_text(100, 101, true),
+            "showing first 100 matching rows (more available) · 101 rows read"
+        );
+        assert_eq!(status_text(7, 500, false), "7 matching rows of 500 total");
+        assert_eq!(status_text(500, 500, false), "500 rows");
+    }
+
+    #[test]
+    fn scan_counts_rows_read_and_stops_at_limit() {
+        let path = std::env::temp_dir().join(format!("fview-scan-{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\n1,2\n3,4\n5,6\n").unwrap();
+
+        // The limit is hit mid-file, so only part of it is read.
+        let limited = scan(path.clone(), b',', String::new(), false, 2).unwrap();
+        assert_eq!(limited.rows.len(), 2);
+        assert!(limited.truncated);
+        assert_eq!(limited.rows_read, 3);
+
+        // A large enough limit reads the whole file.
+        let full = scan(path.clone(), b',', String::new(), false, 10).unwrap();
+        assert_eq!(full.rows.len(), 3);
+        assert!(!full.truncated);
+        assert_eq!(full.rows_read, 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

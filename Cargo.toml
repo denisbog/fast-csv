@@ -29,6 +29,7 @@ serde_json = "1"
 regex = "1"
 iced = { version = "0.13", optional = true, default-features = false, features = [
     "tiny-skia",
+    "wgpu",
     "tokio",
     "fira-sans",
     "auto-detect-theme",
