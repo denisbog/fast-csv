@@ -13,22 +13,33 @@
 //! an **Open CSV…** button that opens a native file picker (`rfd`).
 //!
 //! Layout:
-//! * the top bar holds the regex filter and, when attributes are hidden, a chip
-//!   per hidden attribute (click a chip to show the attribute again);
+//! * the top bar holds the regex filter and the profile controls;
+//! * a second bar holds the attribute filter and, when attributes are hidden,
+//!   a chip per hidden attribute (click a chip to show the attribute again).
+//!   Hidden chips are sorted alphabetically so large attribute lists stay
+//!   navigable; the attribute filter narrows the hidden list to the matching
+//!   names (and highlights the matching chips in the main view);
 //! * every matching row is rendered as a set of `attribute = value` chips, each
 //!   with a mute icon that hides that attribute from all rows and moves its name
 //!   into the top bar.
+//!
+//! Profiles: the set of currently visible attributes can be saved under a name
+//! and re-applied later. Profiles are persisted as TOML in the platform config
+//! directory (`<config>/fview/profiles.toml`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Row};
+use iced::widget::{
+    button, column, container, pick_list, row, scrollable, text, text_input, Row,
+};
 use iced::{Background, Border, Center, Element, Fill, Length, Subscription, Task, Theme};
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
 use regex::RegexBuilder;
+use serde::{Deserialize, Serialize};
 use simd_csv::ByteRecord;
 
 const BUFFER_CAPACITY: usize = 64 * 1024;
@@ -66,6 +77,59 @@ struct ScanResult {
     truncated: bool,
 }
 
+/// A named set of visible attributes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProfileConfig {
+    #[serde(default)]
+    visible: Vec<String>,
+}
+
+/// The whole persisted configuration file (`<config>/fview/profiles.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    profiles: BTreeMap<String, ProfileConfig>,
+}
+
+/// Resolve the path of the TOML profile store.
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("fview").join("profiles.toml"))
+}
+
+/// Load the profile store, falling back to an empty set on any I/O or parse
+/// error (a broken config should never stop the viewer from opening).
+fn load_config() -> Config {
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Config::default();
+    };
+    toml::from_str(&text).unwrap_or_default()
+}
+
+/// Persist the profile store as pretty TOML, creating the directory if needed.
+fn store_config(config: &Config) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Err("cannot determine a config directory".into());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let text =
+        toml::to_string_pretty(config).map_err(|e| format!("cannot serialize profiles: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Case-insensitive substring test used by the attribute filter. An empty
+/// filter never matches (used for highlighting) and never hides (used for the
+/// hidden list), so callers handle the empty case explicitly where needed.
+fn attr_matches(filter: &str, name: &str) -> bool {
+    let filter = filter.trim();
+    !filter.is_empty() && name.to_lowercase().contains(&filter.to_lowercase())
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     OpenFile,
@@ -79,6 +143,20 @@ enum Message {
     UnmuteAll,
     /// Hide every attribute at once, so a few can be picked back.
     MuteAll,
+    /// The attribute search box changed: highlight matching chips and narrow
+    /// the hidden attribute list.
+    AttributeFilterChanged(String),
+    /// A saved profile was picked from the dropdown.
+    ProfileSelected(String),
+    /// Clear the selected profile (attributes stay as they are).
+    ClearProfile,
+    /// Overwrite the selected profile with the current visible attributes.
+    SaveCurrentProfile,
+    /// Open the "save as new profile" name prompt.
+    BeginSaveNewProfile,
+    NewProfileNameChanged(String),
+    ConfirmSaveNewProfile,
+    CancelSaveNewProfile,
     /// `(generation, result)`; stale generations are ignored.
     ScanFinished(u64, Result<ScanResult, String>),
     /// The window was resized; used to wrap chips onto several lines.
@@ -100,6 +178,18 @@ struct Viewer {
     dirty: bool,
     generation: u64,
     window_width: f32,
+    /// Attribute search: highlights matching chips in the main view and narrows
+    /// the hidden attribute list to the matching names.
+    attribute_filter: String,
+    /// Saved profiles, keyed by name.
+    profiles: BTreeMap<String, ProfileConfig>,
+    /// Profile currently applied, if any.
+    current_profile: Option<String>,
+    /// Whether the "save as new profile" name prompt is open.
+    naming_profile: bool,
+    new_profile_name: String,
+    /// Short feedback message about profile actions (shown next to the controls).
+    profile_status: Option<String>,
 }
 
 impl Viewer {
@@ -121,6 +211,12 @@ impl Viewer {
             dirty: false,
             generation: 0,
             window_width: 1200.0,
+            attribute_filter: String::new(),
+            profiles: load_config().profiles,
+            current_profile: None,
+            naming_profile: false,
+            new_profile_name: String::new(),
+            profile_status: None,
         };
 
         let task = match args.path {
@@ -155,6 +251,10 @@ impl Viewer {
         self.truncated = false;
         self.muted.clear();
         self.error = None;
+        self.current_profile = None;
+        self.naming_profile = false;
+        self.new_profile_name.clear();
+        self.profile_status = None;
         self.path = Some(path.clone());
 
         match read_headers(&path, self.delimiter) {
@@ -167,6 +267,76 @@ impl Viewer {
                 self.error = Some(message);
                 Task::none()
             }
+        }
+    }
+
+    /// Names of the attributes currently visible (the active set).
+    fn visible_names(&self) -> Vec<String> {
+        self.headers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.muted.contains(index))
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    /// Apply a saved profile: attributes listed in it become visible, every
+    /// other attribute is treated as hidden.
+    fn apply_profile(&mut self, name: &str) {
+        let Some(profile) = self.profiles.get(name).cloned() else {
+            self.profile_status = Some(format!("unknown profile “{name}”"));
+            return;
+        };
+        let visible: HashSet<&str> = profile.visible.iter().map(String::as_str).collect();
+        self.muted = self
+            .headers
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| !visible.contains(header.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        self.current_profile = Some(name.to_string());
+        self.profile_status = Some(format!("applied “{name}”"));
+    }
+
+    /// Persist the current profile set to the TOML store.
+    fn persist(&self) -> Result<(), String> {
+        store_config(&Config {
+            profiles: self.profiles.clone(),
+        })
+    }
+
+    /// Overwrite the profile that is currently selected with the attributes
+    /// that are visible right now.
+    fn save_current_profile(&mut self) {
+        let Some(name) = self.current_profile.clone() else {
+            return;
+        };
+        let visible = self.visible_names();
+        self.profiles.insert(name.clone(), ProfileConfig { visible });
+        match self.persist() {
+            Ok(()) => self.profile_status = Some(format!("saved “{name}”")),
+            Err(message) => self.profile_status = Some(message),
+        }
+    }
+
+    /// Save the visible attributes under the name typed in the prompt.
+    fn save_new_profile(&mut self) {
+        let name = self.new_profile_name.trim().to_string();
+        if name.is_empty() {
+            self.profile_status = Some("enter a profile name".into());
+            return;
+        }
+        let visible = self.visible_names();
+        self.profiles.insert(name.clone(), ProfileConfig { visible });
+        match self.persist() {
+            Ok(()) => {
+                self.current_profile = Some(name.clone());
+                self.naming_profile = false;
+                self.new_profile_name.clear();
+                self.profile_status = Some(format!("saved “{name}”"));
+            }
+            Err(message) => self.profile_status = Some(message),
         }
     }
 
@@ -209,18 +379,59 @@ impl Viewer {
             Message::RunFilter => self.start_scan(),
             Message::Mute(index) => {
                 self.muted.insert(index);
+                self.profile_status = None;
                 Task::none()
             }
             Message::Unmute(index) => {
                 self.muted.remove(&index);
+                self.profile_status = None;
                 Task::none()
             }
             Message::UnmuteAll => {
                 self.muted.clear();
+                self.profile_status = None;
                 Task::none()
             }
             Message::MuteAll => {
                 self.muted = (0..self.headers.len()).collect();
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::AttributeFilterChanged(value) => {
+                self.attribute_filter = value;
+                Task::none()
+            }
+            Message::ProfileSelected(name) => {
+                self.apply_profile(&name);
+                Task::none()
+            }
+            Message::ClearProfile => {
+                self.current_profile = None;
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::SaveCurrentProfile => {
+                self.save_current_profile();
+                Task::none()
+            }
+            Message::BeginSaveNewProfile => {
+                self.naming_profile = true;
+                self.new_profile_name.clear();
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::NewProfileNameChanged(value) => {
+                self.new_profile_name = value;
+                Task::none()
+            }
+            Message::ConfirmSaveNewProfile => {
+                self.save_new_profile();
+                Task::none()
+            }
+            Message::CancelSaveNewProfile => {
+                self.naming_profile = false;
+                self.new_profile_name.clear();
+                self.profile_status = None;
                 Task::none()
             }
             Message::Resized(width) => {
@@ -391,18 +602,104 @@ impl Viewer {
                     .style(button::text),
             );
         }
+        // Attribute filter: highlights matching chips in the main view and
+        // narrows the hidden attribute list below to the matching names.
+        controls = controls.push(text("Attributes:").size(13));
+        controls = controls.push(
+            text_input("filter attributes…", &self.attribute_filter)
+                .on_input(Message::AttributeFilterChanged)
+                .padding(6)
+                .size(13)
+                .width(Length::Fixed(200.0)),
+        );
+
+        // Profile controls: pick a saved profile, overwrite it, or save the
+        // current visible set under a new name.
+        let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
+        controls = controls.push(text("Profile:").size(13));
+        controls = controls.push(
+            pick_list(
+                profile_names,
+                self.current_profile.clone(),
+                Message::ProfileSelected,
+            )
+            .placeholder("none")
+            .padding(6)
+            .text_size(13),
+        );
+        if self.current_profile.is_some() {
+            controls = controls.push(
+                button(text("Save").size(13))
+                    .on_press(Message::SaveCurrentProfile)
+                    .padding([3, 8])
+                    .style(button::primary),
+            );
+            controls = controls.push(
+                button(text("clear").size(13))
+                    .on_press(Message::ClearProfile)
+                    .padding([3, 8])
+                    .style(button::text),
+            );
+        }
+        controls = controls.push(
+            button(text("Save as new…").size(13))
+                .on_press(Message::BeginSaveNewProfile)
+                .padding([3, 8])
+                .style(button::secondary),
+        );
+        if let Some(status) = &self.profile_status {
+            controls = controls.push(text(status.as_str()).size(12));
+        }
         hidden_bar = hidden_bar.push(controls);
 
-        // The hidden attribute names also wrap onto several lines.
+        // Prompt for the name of a new profile.
+        if self.naming_profile {
+            hidden_bar = hidden_bar.push(
+                row![
+                    text("New profile name:").size(13),
+                    text_input("profile name", &self.new_profile_name)
+                        .on_input(Message::NewProfileNameChanged)
+                        .on_submit(Message::ConfirmSaveNewProfile)
+                        .padding(6)
+                        .size(13)
+                        .width(Length::Fixed(200.0)),
+                    button(text("Save").size(13))
+                        .on_press(Message::ConfirmSaveNewProfile)
+                        .padding([3, 8])
+                        .style(button::primary),
+                    button(text("Cancel").size(13))
+                        .on_press(Message::CancelSaveNewProfile)
+                        .padding([3, 8])
+                        .style(button::text),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+        // The hidden attribute names wrap onto several lines, sorted
+        // alphabetically so a large attribute list stays easy to scan. When
+        // the attribute filter is non-empty only matching names are shown.
         if !self.muted.is_empty() {
             let mut indices: Vec<usize> = self.muted.iter().copied().collect();
-            indices.sort_unstable();
+            indices.sort_by(|a, b| {
+                let left = self.headers.get(*a).map(String::as_str).unwrap_or("");
+                let right = self.headers.get(*b).map(String::as_str).unwrap_or("");
+                left.to_lowercase()
+                    .cmp(&right.to_lowercase())
+                    .then_with(|| a.cmp(b))
+            });
+            let filtering = !self.attribute_filter.trim().is_empty();
             let mut line = Row::new().spacing(6).align_y(Center);
             let mut count = 0usize;
+            let mut shown = 0usize;
             for index in indices {
                 let Some(name) = self.headers.get(index) else {
                     continue;
                 };
+                if filtering && !attr_matches(&self.attribute_filter, name) {
+                    continue;
+                }
                 if count == hidden_columns {
                     hidden_bar = hidden_bar.push(line);
                     line = Row::new().spacing(6).align_y(Center);
@@ -422,8 +719,14 @@ impl Viewer {
                     .style(button::secondary),
                 );
                 count += 1;
+                shown += 1;
             }
-            hidden_bar = hidden_bar.push(line);
+            if shown > 0 {
+                hidden_bar = hidden_bar.push(line);
+            } else {
+                hidden_bar =
+                    hidden_bar.push(text("no hidden attributes match the filter").size(13));
+            }
         }
 
         let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
@@ -458,7 +761,8 @@ impl Viewer {
                     let mut line = Row::new().spacing(CHIP_SPACING);
                     for &index in chunk {
                         let header = self.headers.get(index).map(String::as_str).unwrap_or("?");
-                        line = line.push(chip(header, &values[index], index, chip_max));
+                        let highlight = attr_matches(&self.attribute_filter, header);
+                        line = line.push(chip(header, &values[index], index, chip_max, highlight));
                     }
                     block = block.push(line);
                 }
@@ -494,8 +798,21 @@ fn stripe_style(active: bool) -> impl Fn(&Theme) -> container::Style {
 
 /// Chip style: a transparent background (the row color shows through) with a
 /// border, so a chip never blends into the plain or the striped row background.
-fn chip_style(theme: &Theme) -> container::Style {
+/// Highlighted chips (those matching the attribute filter) get an accent
+/// background and border.
+fn chip_style(theme: &Theme, highlight: bool) -> container::Style {
     let palette = theme.extended_palette();
+    if highlight {
+        return container::Style {
+            background: Some(Background::Color(palette.primary.weak.color)),
+            border: Border {
+                color: palette.primary.strong.color,
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        };
+    }
     container::Style {
         background: None,
         border: Border {
@@ -507,8 +824,15 @@ fn chip_style(theme: &Theme) -> container::Style {
     }
 }
 
-/// A single `attribute = value` chip with a mute icon.
-fn chip<'a>(header: &'a str, value: &'a str, index: usize, max_width: f32) -> Element<'a, Message> {
+/// A single `attribute = value` chip with a mute icon. `highlight` marks chips
+/// whose attribute name matches the attribute filter.
+fn chip<'a>(
+    header: &'a str,
+    value: &'a str,
+    index: usize,
+    max_width: f32,
+    highlight: bool,
+) -> Element<'a, Message> {
     let label_text = format!("{header} = {value}");
     let content_width = (max_width - CHIP_CHROME).max(60.0);
     let label = if estimate_chip_width(&label_text) > max_width {
@@ -527,7 +851,7 @@ fn chip<'a>(header: &'a str, value: &'a str, index: usize, max_width: f32) -> El
 
     container(row![label, mute].spacing(6).align_y(Center))
         .padding([3, 8])
-        .style(chip_style)
+        .style(move |theme| chip_style(theme, highlight))
         .into()
 }
 
@@ -641,4 +965,33 @@ fn main() -> iced::Result {
         .font(BOOTSTRAP_FONT_BYTES)
         .window_size((1200.0, 820.0))
         .run_with(move || Viewer::new(args))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            "compact".into(),
+            ProfileConfig {
+                visible: vec!["id".into(), "name".into()],
+            },
+        );
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[profiles.compact]"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.profiles["compact"].visible, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn attr_matches_is_case_insensitive_and_empty_never_matches() {
+        assert!(attr_matches("NAME", "full_name"));
+        assert!(attr_matches("  name ", "full_name"));
+        assert!(!attr_matches("", "full_name"));
+        assert!(!attr_matches("   ", "full_name"));
+        assert!(!attr_matches("age", "full_name"));
+    }
 }

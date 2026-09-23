@@ -343,9 +343,9 @@ fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_
 
 The crate also ships a second, **optional** binary that greps and browses rows
 of a big CSV file in a window. It depends on [`iced`](https://iced.rs) and
-[`rfd`](https://github.com/PolyMeilex/rfd) for the native file picker, both
-optional dependencies behind the `gui` feature, so the default `fvalidate`
-build stays GUI-free.
+[`rfd`](https://github.com/PolyMeilex/rfd) for the native file picker (plus
+`toml` and `dirs` for the profile store), all optional dependencies behind the
+`gui` feature, so the default `fvalidate` build stays GUI-free.
 
 ```bash
 # Open empty, then use the "Open CSV…" button
@@ -375,6 +375,30 @@ found, so large files stay responsive. Chips wrap onto as many lines as needed
 based on the window width (tracked via resize events), the hidden-attribute
 chips wrap too, and a very long value wraps inside its own chip, so a wide
 record never overflows or breaks the layout.
+
+### Large attribute lists, search and profiles
+
+To keep wide files manageable:
+
+* the hidden-attribute chips in the top bar are sorted **alphabetically**
+  (case-insensitively), so **Hide all** on a file with hundreds of columns
+  still produces a scannable list;
+* an **Attributes:** search box filters the attribute list. Matching chips in
+  the main view are **highlighted** (accent background/border), while the
+  hidden-attribute list is narrowed to just the matching names — so you can
+  find and reveal a column without scrolling;
+* the set of currently **visible** attributes can be saved as a named
+  **profile**. Profiles are persisted as TOML in the platform config directory
+  (`$XDG_CONFIG_HOME/fview/profiles.toml`, i.e. `~/.config/fview/profiles.toml`
+  by default). The **Profile:** dropdown applies a saved profile to the current
+  file: attributes named in it are shown and every other attribute is marked
+  hidden. After editing the attribute list, **Save** overwrites the selected
+  profile or **Save as new…** opens a prompt for a profile name.
+
+```toml
+[profiles.compact]
+visible = ["id", "name", "amount"]
+```
 
 Files:
 
