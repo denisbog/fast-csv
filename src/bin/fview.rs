@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
@@ -57,7 +57,11 @@ use iced::widget::{
     button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, text,
     text_input, Row, Space,
 };
-use iced::{Background, Border, Center, Element, Fill, Length, Subscription, Task, Theme};
+use iced::theme::Palette;
+use iced::{
+    Background, Border, Center, Color, Element, Fill, Length, Shadow, Subscription, Task, Theme,
+    Vector,
+};
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -97,6 +101,13 @@ const OVERSCAN_ROWS: usize = 3;
 const TARGET_CHIP_WIDTH: f32 = 280.0;
 /// Rough width of one character at size 13, used to decide text wrapping.
 const CHAR_WIDTH: f32 = 7.2;
+/// Corner radius shared by cards, inputs and buttons.
+const RADIUS: f32 = 4.0;
+/// Corner radius of the large floating panels.
+const CARD_RADIUS: f32 = 6.0;
+/// Height reserved for the status line. Fixed so the different states (plain
+/// text, the taller icon + "scanning…" row) do not nudge the rows below it.
+const STATUS_HEIGHT: f32 = 22.0;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "fview", about = "Grep and browse rows of a big CSV file (GUI)")]
@@ -908,6 +919,12 @@ impl Viewer {
         }
     }
 
+    /// App theme, handed to iced once at startup; every custom style above
+    /// reads its colors from the palette it defines.
+    fn theme(&self) -> Theme {
+        modern_theme()
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         let resize = iced::window::resize_events()
             .map(|(_id, size)| Message::Resized(size.width, size.height));
@@ -923,32 +940,81 @@ impl Viewer {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // No file yet: welcome screen with an Open button.
+        let theme = self.theme();
+        let palette = theme.extended_palette();
+
+        // No file yet: a single floating card with the Open call to action.
         if self.path.is_none() {
             return container(
-                column![
-                    text("No CSV file opened").size(22),
-                    text("Grep and browse rows of a large CSV file.").size(14),
-                    button(
-                        row![
-                            text(char::from(Bootstrap::FolderFill))
+                container(
+                    column![
+                        container(
+                            text(char::from(Bootstrap::FileEarmarkSpreadsheetFill))
                                 .font(BOOTSTRAP_FONT)
-                                .size(16),
-                            text("Open CSV…").size(16),
-                        ]
-                        .spacing(8)
-                        .align_y(Center),
-                    )
-                    .on_press(Message::OpenFile)
-                    .padding([10, 22]),
-                ]
-                .spacing(16)
-                .align_x(Center),
+                                .size(30)
+                                .color(palette.primary.base.color),
+                        )
+                        .padding(16)
+                        .style(|theme: &Theme| container::Style {
+                            background: Some(Background::Color(
+                                theme.extended_palette().primary.weak.color,
+                            )),
+                            border: Border {
+                                radius: 10.0.into(),
+                                ..Border::default()
+                            },
+                            ..container::Style::default()
+                        }),
+                        text("No CSV file opened").size(24),
+                        text("Grep and browse rows of a large CSV file.")
+                            .size(14)
+                            .color(muted_text(&theme)),
+                        button(
+                            row![
+                                text(char::from(Bootstrap::FolderFill))
+                                    .font(BOOTSTRAP_FONT)
+                                    .size(16),
+                                text("Open CSV…").size(16),
+                            ]
+                            .spacing(8)
+                            .align_y(Center),
+                        )
+                        .on_press(Message::OpenFile)
+                        .padding([12, 24])
+                        .style(primary_button),
+                    ]
+                    .spacing(14)
+                    .align_x(Center),
+                )
+                .padding(40)
+                .style(card_style),
             )
             .center_x(Fill)
             .center_y(Fill)
             .into();
         }
+
+        // Small app mark: an accent tile with the spreadsheet glyph.
+        let brand = row![
+            container(
+                text(char::from(Bootstrap::FileEarmarkSpreadsheetFill))
+                    .font(BOOTSTRAP_FONT)
+                    .size(14)
+                    .color(Color::WHITE),
+            )
+            .padding([5, 6])
+            .style(|theme: &Theme| container::Style {
+                background: Some(Background::Color(theme.extended_palette().primary.base.color)),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            }),
+            text("fview").size(16),
+        ]
+        .spacing(8)
+        .align_y(Center);
 
         let open = button(
             row![
@@ -961,7 +1027,8 @@ impl Viewer {
             .align_y(Center),
         )
         .on_press(Message::OpenFile)
-        .padding([8, 14]);
+        .padding([8, 14])
+        .style(secondary_button);
 
         let file_name = self
             .path
@@ -978,9 +1045,10 @@ impl Viewer {
         let filter = text_input(filter_hint, &self.filter)
             .on_input(Message::FilterChanged)
             .on_submit(Message::RunFilter)
-            .padding(8)
-            .size(15)
-            .width(Fill);
+            .padding(10)
+            .size(14)
+            .width(Fill)
+            .style(input_style);
 
         let search = button(
             row![
@@ -991,20 +1059,31 @@ impl Viewer {
             .align_y(Center),
         )
         .on_press(Message::RunFilter)
-        .padding([8, 14]);
+        .padding([10, 18])
+        .style(primary_button);
 
         let status: Element<'_, Message> = if let Some(error) = &self.error {
             row![
                 text(char::from(Bootstrap::ExclamationTriangle))
                     .font(BOOTSTRAP_FONT)
-                    .color([0.85, 0.25, 0.2]),
-                text(error.as_str()).color([0.85, 0.25, 0.2]),
+                    .size(13)
+                    .color(palette.danger.base.color),
+                text(error.as_str()).size(13).color(palette.danger.base.color),
             ]
             .spacing(6)
             .align_y(Center)
             .into()
         } else if self.scanning {
-            text("scanning…").into()
+            row![
+                text(char::from(Bootstrap::HourglassSplit))
+                    .font(BOOTSTRAP_FONT)
+                    .size(13)
+                    .color(palette.primary.base.color),
+                text("scanning…").size(13).color(palette.primary.base.color),
+            ]
+            .spacing(6)
+            .align_y(Center)
+            .into()
         } else {
             text(status_text(
                 self.rows.len(),
@@ -1013,6 +1092,8 @@ impl Viewer {
                 self.truncated,
                 self.indexed_result,
             ))
+            .size(13)
+            .color(muted_text(&theme))
             .into()
         };
 
@@ -1022,40 +1103,57 @@ impl Viewer {
         let options = row![
             checkbox("visible only", self.visible_only)
                 .on_toggle(Message::ToggleVisibleOnly)
-                .text_size(12),
+                .text_size(12)
+                .style(checkbox_style),
             checkbox("parallel", self.parallel)
                 .on_toggle(Message::ToggleParallel)
-                .text_size(12),
+                .text_size(12)
+                .style(checkbox_style),
             checkbox("table", self.table)
                 .on_toggle(Message::ToggleTable)
-                .text_size(12),
+                .text_size(12)
+                .style(checkbox_style),
             checkbox("index", self.use_index)
                 .on_toggle_maybe((!self.indexes.is_empty()).then_some(Message::ToggleUseIndex))
-                .text_size(12),
+                .text_size(12)
+                .style(checkbox_style),
         ]
-        .spacing(10)
+        .spacing(12)
         .align_y(Center);
 
-        let top = row![
-            open,
-            text(file_name).size(13),
-            text("Filter:").size(15),
-            filter,
-            search,
-            options,
-        ]
-        .spacing(10)
-        .align_y(Center)
-        .padding(10);
+        let toolbar = container(
+            row![
+                brand,
+                open,
+                container(text(file_name).size(13).color(muted_text(&theme)))
+                    .padding([4, 10])
+                    .style(badge_style),
+                Space::with_width(2),
+                text("Filter").size(13).color(muted_text(&theme)),
+                filter,
+                search,
+                options,
+            ]
+            .spacing(10)
+            .align_y(Center),
+        )
+        .padding(12)
+        .width(Fill)
+        .style(card_style);
 
         // The status gets its own line so a long message cannot squeeze the
-        // filter field in the bar above.
-        let status_bar = container(status).padding([0.0, 10.0]);
+        // filter field in the bar above. It keeps a fixed height because the
+        // scanning/error states are taller than plain status text and would
+        // otherwise shift the table down by a few pixels.
+        let status_bar = container(status)
+            .height(Length::Fixed(STATUS_HEIGHT))
+            .align_y(Center)
+            .padding([0.0, 4.0]);
 
         // Hidden attributes live in the top bar; clicking restores them.
         let (columns, chip_max, hidden_columns) = chip_layout(self.window_width);
 
-        let mut hidden_bar = column![].spacing(4).padding([4, 10]);
+        let mut hidden_bar = column![].spacing(6).padding(0);
         let mut controls = Row::new().spacing(6).align_y(Center);
         controls = controls.push(
             button(
@@ -1070,7 +1168,7 @@ impl Viewer {
             )
             .on_press(Message::MuteAll)
             .padding([3, 8])
-            .style(button::secondary),
+            .style(secondary_button),
         );
         if !self.muted.is_empty() {
             // Collapsible list of hidden attributes: long lists would otherwise
@@ -1091,30 +1189,31 @@ impl Viewer {
                 )
                 .on_press(Message::ToggleHidden)
                 .padding([3, 8])
-                .style(button::secondary),
+                .style(secondary_button),
             );
             controls = controls.push(
                 button(text("show all").size(13))
                     .on_press(Message::UnmuteAll)
                     .padding([3, 8])
-                    .style(button::text),
+                    .style(ghost_button),
             );
         }
         // Attribute filter: highlights matching chips in the main view and
         // narrows the hidden attribute list below to the matching names.
-        controls = controls.push(text("Attributes:").size(13));
+        controls = controls.push(text("Attributes:").size(13).color(muted_text(&theme)));
         controls = controls.push(
             text_input("filter attributes…", &self.attribute_filter)
                 .on_input(Message::AttributeFilterChanged)
-                .padding(6)
+                .padding(8)
                 .size(13)
+                .style(input_style)
                 .width(Length::Fixed(200.0)),
         );
 
         // Profile controls: pick a saved profile, overwrite it, or save the
         // current visible set under a new name.
         let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
-        controls = controls.push(text("Profile:").size(13));
+        controls = controls.push(text("Profile:").size(13).color(muted_text(&theme)));
         controls = controls.push(
             pick_list(
                 profile_names,
@@ -1122,28 +1221,29 @@ impl Viewer {
                 Message::ProfileSelected,
             )
             .placeholder("none")
-            .padding(6)
-            .text_size(13),
+            .padding(8)
+            .text_size(13)
+            .style(pick_list_style),
         );
         if self.current_profile.is_some() {
             controls = controls.push(
                 button(text("Save").size(13))
                     .on_press(Message::SaveCurrentProfile)
                     .padding([3, 8])
-                    .style(button::primary),
+                    .style(primary_button),
             );
             controls = controls.push(
                 button(text("clear").size(13))
                     .on_press(Message::ClearProfile)
                     .padding([3, 8])
-                    .style(button::text),
+                    .style(ghost_button),
             );
         }
         controls = controls.push(
             button(text("Save as new…").size(13))
                 .on_press(Message::BeginSaveNewProfile)
                 .padding([3, 8])
-                .style(button::secondary),
+                .style(secondary_button),
         );
         if let Some(status) = &self.profile_status {
             controls = controls.push(text(status.as_str()).size(12));
@@ -1157,21 +1257,22 @@ impl Viewer {
         if self.naming_profile {
             hidden_bar = hidden_bar.push(
                 row![
-                    text("New profile name:").size(13),
+                    text("New profile name:").size(13).color(muted_text(&theme)),
                     text_input("profile name", &self.new_profile_name)
                         .on_input(Message::NewProfileNameChanged)
                         .on_submit(Message::ConfirmSaveNewProfile)
-                        .padding(6)
+                        .padding(8)
                         .size(13)
+                        .style(input_style)
                         .width(Length::Fixed(200.0)),
                     button(text("Save").size(13))
                         .on_press(Message::ConfirmSaveNewProfile)
                         .padding([3, 8])
-                        .style(button::primary),
+                        .style(primary_button),
                     button(text("Cancel").size(13))
                         .on_press(Message::CancelSaveNewProfile)
                         .padding([3, 8])
-                        .style(button::text),
+                        .style(ghost_button),
                 ]
                 .spacing(6)
                 .align_y(Center),
@@ -1232,10 +1333,10 @@ impl Viewer {
                                             palette.success.weak.color,
                                         )),
                                         text_color: palette.success.strong.color,
-                                        ..button::secondary(theme, status)
+                                        ..secondary_button(theme, status)
                                     }
                                 } else {
-                                    button::secondary(theme, status)
+                                    secondary_button(theme, status)
                                 }
                             }
                         }),
@@ -1251,6 +1352,13 @@ impl Viewer {
                 }
             }
         }
+
+        // The attribute/profile controls sit in their own card below the
+        // toolbar, so the search row keeps the full window width.
+        let controls_card = container(hidden_bar)
+            .width(Fill)
+            .padding([10, 12])
+            .style(card_style);
 
         let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
         let visible_columns: Vec<usize> = (0..self.headers.len())
@@ -1321,26 +1429,19 @@ impl Viewer {
                         button(text(self.header(column)).size(13))
                             .on_press(Message::ToggleIndex(column))
                             .width(Length::Fixed(column_widths[column_position]))
-                            .padding([5, 6])
-                            .style(move |theme: &Theme, _status| {
-                                let palette = theme.extended_palette();
-                                let background = if indexed {
-                                    Some(Background::Color(palette.success.weak.color))
-                                } else {
-                                    Some(Background::Color(palette.background.weak.color))
-                                };
-                                button::Style {
-                                    background,
-                                    text_color: palette.background.base.text,
-                                    ..button::Style::default()
-                                }
-                            }),
+                            .padding([5, 10])
+                            .style(table_header_style(indexed)),
                     );
                 }
                 list = list.push(
                     container(header_line)
                         .width(Length::Fixed(table_width))
                         .style(stripe_style(true)),
+                );
+                // Hairline under the header so the first row reads as data.
+                list = list.push(
+                    container(horizontal_rule(1).style(divider_style))
+                        .width(Length::Fixed(table_width)),
                 );
             }
 
@@ -1360,7 +1461,7 @@ impl Viewer {
                             container(text(cell).size(13).wrapping(Wrapping::None))
                                 .width(Length::Fixed(column_widths[column_position]))
                                 .clip(true)
-                                .padding([3, 6]),
+                                .padding([3, 10]),
                         );
                     }
                     list = list.push(
@@ -1429,29 +1530,256 @@ impl Viewer {
         };
 
         column![
-            top,
+            toolbar,
             status_bar,
-            hidden_bar,
-            horizontal_rule(1).style(divider_style),
-            scrollable(list)
-                .id(self.scroll_id.clone())
-                .on_scroll(Message::Scrolled)
-                .direction(direction)
-                .height(Fill)
-                .width(Fill)
+            controls_card,
+            container(
+                scrollable(list)
+                    .id(self.scroll_id.clone())
+                    .on_scroll(Message::Scrolled)
+                    .direction(direction)
+                    .style(scrollbar_style)
+                    .height(Fill)
+                    .width(Fill)
+            )
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .style(card_style)
         ]
-        .spacing(0)
+        .spacing(8)
+        .padding(10)
         .into()
     }
 }
 
-/// Divider between the toolbar and the rows. Uses the theme's text color so it
-/// stays distinct from both the plain and the striped (`background.weak`) row
-/// backgrounds that the default `Rule` color blends into.
+/// The app theme: a soft neutral canvas with a single indigo accent. Two
+/// palettes are defined so a dark-mode desktop keeps a dark window.
+fn modern_theme() -> Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(build_theme).clone()
+}
+
+/// Built once: OS dark mode is only read at startup, so the palette does not
+/// have to be regenerated on every redraw.
+fn build_theme() -> Theme {
+    let palette = if matches!(Theme::default(), Theme::Dark) {
+        Palette {
+            background: Color::from_rgb(0.082, 0.090, 0.118),
+            text: Color::from_rgb(0.902, 0.910, 0.937),
+            primary: Color::from_rgb(0.506, 0.463, 0.976),
+            success: Color::from_rgb(0.204, 0.780, 0.596),
+            danger: Color::from_rgb(0.937, 0.353, 0.353),
+        }
+    } else {
+        Palette {
+            background: Color::from_rgb(0.961, 0.965, 0.980),
+            text: Color::from_rgb(0.106, 0.122, 0.188),
+            primary: Color::from_rgb(0.310, 0.275, 0.898),
+            success: Color::from_rgb(0.020, 0.588, 0.412),
+            danger: Color::from_rgb(0.863, 0.149, 0.149),
+        }
+    };
+    Theme::custom("fview".to_string(), palette)
+}
+
+/// Secondary text: the theme text color faded so hierarchy stays readable in
+/// both light and dark mode.
+fn muted_text(theme: &Theme) -> Color {
+    Color {
+        a: 0.6,
+        ..theme.extended_palette().background.base.text
+    }
+}
+
+/// Floating panel: white surface, hairline border and a soft drop shadow.
+fn card_style(theme: &Theme) -> container::Style {
+    let dark = theme.extended_palette().is_dark;
+    let (surface, border, shadow) = if dark {
+        (
+            Color::from_rgb(0.118, 0.129, 0.169),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+            Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+        )
+    } else {
+        (
+            Color::WHITE,
+            Color::from_rgba(0.06, 0.09, 0.16, 0.08),
+            Color::from_rgba(0.06, 0.09, 0.16, 0.06),
+        )
+    };
+    container::Style {
+        background: Some(Background::Color(surface)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: CARD_RADIUS.into(),
+        },
+        shadow: Shadow {
+            color: shadow,
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 6.0,
+        },
+        text_color: None,
+    }
+}
+
+/// Pill used for the file name and other small metadata badges.
+fn badge_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weak.color)),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Rounded, softly tinted text input that highlights the accent while focused.
+fn input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let palette = theme.extended_palette();
+    let background = if palette.is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+    } else {
+        Color::from_rgb(0.973, 0.976, 0.988)
+    };
+    let border = if matches!(status, text_input::Status::Focused) {
+        palette.primary.base.color
+    } else {
+        palette.background.strong.color
+    };
+    text_input::Style {
+        background: Background::Color(background),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        icon: palette.background.base.text,
+        placeholder: muted_text(theme),
+        value: palette.background.base.text,
+        selection: palette.primary.weak.color,
+    }
+}
+
+/// Solid accent button (Open, Search, Save).
+fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::primary(theme, status);
+    style.border.radius = RADIUS.into();
+    style.shadow = Shadow {
+        color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+        offset: Vector::new(0.0, 1.0),
+        blur_radius: 4.0,
+    };
+    style
+}
+
+/// Quiet outlined button.
+fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    style.border.radius = RADIUS.into();
+    style
+}
+
+/// Borderless button used for inline/icon actions.
+fn ghost_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::text(theme, status);
+    style.border.radius = RADIUS.into();
+    style
+}
+
+/// Rounded checkbox with the accent color and white tick.
+fn checkbox_style(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let checked = matches!(
+        status,
+        checkbox::Status::Active { is_checked: true }
+            | checkbox::Status::Hovered { is_checked: true }
+    );
+    let mut style = if checked {
+        checkbox::primary(theme, status)
+    } else {
+        checkbox::secondary(theme, status)
+    };
+    style.border.radius = 3.0.into();
+    style.border.width = 1.0;
+    style
+}
+
+/// Rounded drop-down matching the text inputs.
+fn pick_list_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let mut style = pick_list::default(theme, status);
+    style.border.radius = RADIUS.into();
+    style
+}
+
+/// Table header cell: quiet on rest, accent-tinted on hover so the click-to-index
+/// affordance is discoverable. Indexed columns keep the success accent.
+fn table_header_style(indexed: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let palette = theme.extended_palette();
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let background = if indexed {
+            if hovered {
+                palette.success.base.color
+            } else {
+                palette.success.weak.color
+            }
+        } else if hovered {
+            palette.primary.weak.color
+        } else {
+            palette.background.weak.color
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: if indexed && hovered {
+                palette.success.base.text
+            } else {
+                palette.background.base.text
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Slim, rounded scrollbar that fades into the panel.
+fn scrollbar_style(theme: &Theme, _status: scrollable::Status) -> scrollable::Style {
+    let palette = theme.extended_palette();
+    let scroller = if palette.is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.22)
+    } else {
+        Color::from_rgba(0.06, 0.09, 0.16, 0.22)
+    };
+    let rail = scrollable::Rail {
+        background: None,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        scroller: scrollable::Scroller {
+            color: scroller,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+        },
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+    }
+}
+
+/// Divider between the toolbar and the rows. Kept for the table header
+/// separator, which sits between the sticky header and the first data row.
 fn divider_style(theme: &Theme) -> iced::widget::rule::Style {
     let palette = theme.extended_palette();
     iced::widget::rule::Style {
-        color: palette.background.base.text,
+        color: palette.background.strong.color,
         width: 1,
         radius: 0.0.into(),
         fill_mode: iced::widget::rule::FillMode::Full,
@@ -1484,7 +1812,7 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
             border: Border {
                 color: palette.success.strong.color,
                 width: 1.5,
-                radius: 8.0.into(),
+                radius: RADIUS.into(),
             },
             ..container::Style::default()
         };
@@ -1495,7 +1823,7 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
             border: Border {
                 color: palette.primary.strong.color,
                 width: 1.5,
-                radius: 8.0.into(),
+                radius: RADIUS.into(),
             },
             ..container::Style::default()
         };
@@ -1505,7 +1833,7 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
         border: Border {
             color: palette.background.strong.color,
             width: 1.0,
-            radius: 8.0.into(),
+            radius: RADIUS.into(),
         },
         ..container::Style::default()
     }
@@ -1542,12 +1870,12 @@ fn chip<'a>(
     let toggle_index = button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
         .on_press(Message::ToggleIndex(index))
         .padding(2)
-        .style(button::text);
+        .style(ghost_button);
 
     let mute = button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
         .on_press(Message::Mute(index))
         .padding(2)
-        .style(button::text);
+        .style(ghost_button);
 
     container(row![label, toggle_index, mute].spacing(6).align_y(Center))
         .padding([3, 8])
@@ -1964,6 +2292,7 @@ fn main() -> iced::Result {
 
     iced::application("fview — CSV viewer", Viewer::update, Viewer::view)
         .subscription(Viewer::subscription)
+        .theme(Viewer::theme)
         .font(BOOTSTRAP_FONT_BYTES)
         .window_size((1200.0, 820.0))
         .run_with(move || Viewer::new(args))
