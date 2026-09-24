@@ -30,14 +30,24 @@
 //! shown, and **parallel** reads the whole file in record-aligned segments
 //! across all cores, which yields exact row/match totals but never exits early.
 //!
+//! Display and indexing: a **table** checkbox renders the matches as a table of
+//! the visible attributes instead of chips. Each chip carries a database button
+//! that builds (or drops) a per-column prefix **index**; indexed attributes are
+//! highlighted (green background, filled icon) in both views. While an index
+//! exists and the **index** checkbox is on, a non-empty filter becomes a
+//! case-insensitive `beginsWith` prefix query over the indexed columns — served
+//! straight from the index, with exact totals and no file scan. Unchecking
+//! **index** (or using `--case-sensitive`) falls back to the regex.
+//!
 //! Profiles: the set of currently visible attributes can be saved under a name
 //! and re-applied later. Profiles are persisted as TOML in the platform config
 //! directory (`<config>/fview/profiles.toml`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
@@ -60,10 +70,15 @@ const BUFFER_CAPACITY: usize = 64 * 1024;
 const DEBOUNCE_TICK_MS: u64 = 50;
 /// Quiet period after the last filter keystroke before a scan is started.
 const DEBOUNCE_QUIET_MS: u64 = 180;
+/// Fixed height of one table row in the table view.
+const TABLE_ROW_HEIGHT: f32 = 24.0;
+/// Minimum width of a table column. The table grows horizontally instead of
+/// squeezing columns below this.
+const TABLE_CELL_MIN_WIDTH: f32 = 160.0;
 /// Spacing between chips, in px.
 const CHIP_SPACING: f32 = 8.0;
-/// Non-text width of a chip: padding + mute icon + inner spacing.
-const CHIP_CHROME: f32 = 48.0;
+/// Non-text width of a chip: padding + index icon + mute icon + inner spacing.
+const CHIP_CHROME: f32 = 66.0;
 /// Non-text height of a chip: vertical padding + border.
 const CHIP_CHROME_V: f32 = 8.0;
 /// Height of a single line of chip text.
@@ -129,6 +144,9 @@ struct ScanResult {
     /// Number of data rows actually read from the file. When `truncated` is
     /// false this is the total number of rows in the file.
     rows_read: usize,
+    /// True when the matches came from a built index (prefix search) rather
+    /// than a file scan.
+    indexed: bool,
 }
 
 impl ScanResult {
@@ -138,7 +156,37 @@ impl ScanResult {
             matched: 0,
             truncated: false,
             rows_read: 0,
+            indexed: false,
         }
+    }
+}
+
+/// A prefix index for one column: one `(lowercased value, row byte offset)`
+/// entry per data row, sorted by value. A `beginsWith` search is then a binary
+/// search followed by a forward scan while the prefix still matches.
+#[derive(Debug, Clone)]
+struct ColumnIndex {
+    entries: Vec<(String, u64)>,
+}
+
+impl ColumnIndex {
+    /// Byte offsets of the rows whose value starts with `prefix`, in file order.
+    /// Matching is case-insensitive (keys are stored lowercased).
+    fn prefix_offsets(&self, prefix: &str) -> Vec<u64> {
+        let prefix = prefix.to_lowercase();
+        let start = self
+            .entries
+            .partition_point(|(value, _)| value.as_str() < prefix.as_str());
+        let mut offsets = Vec::new();
+        for (value, offset) in &self.entries[start..] {
+            if !value.starts_with(&prefix) {
+                break;
+            }
+            offsets.push(*offset);
+        }
+        // Keys are sorted by value, not by position, so restore file order.
+        offsets.sort_unstable();
+        offsets
     }
 }
 
@@ -209,8 +257,20 @@ fn hidden_note(count: usize) -> String {
 /// Status line for the current scan. `rows_read` is the number of data rows
 /// read; when the scan was not truncated it is the total number of rows in the
 /// file.
-fn status_text(shown: usize, matched: usize, rows_read: usize, truncated: bool) -> String {
-    if truncated {
+fn status_text(
+    shown: usize,
+    matched: usize,
+    rows_read: usize,
+    truncated: bool,
+    indexed: bool,
+) -> String {
+    if indexed {
+        if truncated {
+            format!("showing first {shown} of {matched} matching rows (index prefix)")
+        } else {
+            format!("{matched} matching rows (index prefix)")
+        }
+    } else if truncated {
         if matched > shown {
             format!("showing first {shown} of {matched} matching rows · {rows_read} rows read")
         } else {
@@ -263,6 +323,12 @@ enum Message {
     ToggleVisibleOnly(bool),
     /// Use the parallel, full-file scan instead of the sequential early-exit one.
     ToggleParallel(bool),
+    /// Render the matches as a table of the visible attributes instead of chips.
+    ToggleTable(bool),
+    /// Use the built column indexes (prefix search) instead of the regex.
+    ToggleUseIndex(bool),
+    /// Build or drop the prefix index for an attribute.
+    ToggleIndex(usize),
     /// Hide an attribute (column index) from the rows.
     Mute(usize),
     /// Show a previously hidden attribute again.
@@ -288,6 +354,9 @@ enum Message {
     CancelSaveNewProfile,
     /// `(generation, result)`; stale generations are ignored.
     ScanFinished(u64, Result<ScanResult, String>),
+    /// `(column, path, result)`; a background column-index build finished. The
+    /// path is carried so a build that outlives a file switch is discarded.
+    IndexBuilt(usize, PathBuf, Result<ColumnIndex, String>),
     /// The window was resized; used to wrap chips and to size the virtual list.
     Resized(f32, f32),
     /// The scroll position changed; drives the virtual row window.
@@ -324,6 +393,18 @@ struct Viewer {
     visible_only: bool,
     /// Use the parallel full-file scan instead of the sequential early-exit one.
     parallel: bool,
+    /// Render the matches as a table of the visible attributes instead of chips.
+    table: bool,
+    /// Use the built column indexes (prefix search) instead of the regex.
+    use_index: bool,
+    /// Built prefix indexes, keyed by column index.
+    indexes: HashMap<usize, Arc<ColumnIndex>>,
+    /// Whether a column-index build is currently running.
+    indexing: bool,
+    /// Feedback about index actions, shown in the controls bar.
+    index_status: Option<String>,
+    /// Whether the last completed scan used an index (drives the status line).
+    indexed_result: bool,
     generation: u64,
     window_width: f32,
     /// Stable id of the row scrollable, so the view can jump back to the top.
@@ -371,6 +452,12 @@ impl Viewer {
             last_edit: None,
             visible_only: false,
             parallel: false,
+            table: false,
+            use_index: true,
+            indexes: HashMap::new(),
+            indexing: false,
+            index_status: None,
+            indexed_result: false,
             generation: 0,
             window_width: 1200.0,
             scroll_id: scrollable::Id::unique(),
@@ -419,6 +506,10 @@ impl Viewer {
         self.last_scanned = None;
         self.debounce_pending = false;
         self.last_edit = None;
+        self.indexes.clear();
+        self.indexing = false;
+        self.index_status = None;
+        self.indexed_result = false;
         self.muted.clear();
         self.show_hidden = false;
         self.error = None;
@@ -543,22 +634,39 @@ impl Viewer {
         } else {
             None
         };
+        // A built index turns the search into a case-insensitive `beginsWith`
+        // prefix query over the indexed columns. `--case-sensitive` and an empty
+        // pattern keep the regex path.
+        let indexes: Vec<Arc<ColumnIndex>> = self
+            .indexes
+            .iter()
+            .filter(|(column, _)| !self.visible_only || !self.muted.contains(column))
+            .map(|(_, index)| Arc::clone(index))
+            .collect();
+        let index_mode = self.index_mode() && !self.filter.trim().is_empty();
         self.last_scanned = Some(pattern.clone());
 
-        Task::perform(
-            async move {
-                scan(
-                    path,
-                    delimiter,
-                    pattern,
-                    case_sensitive,
-                    limit,
-                    visible,
-                    parallel,
-                )
-            },
-            move |result| Message::ScanFinished(generation, result),
-        )
+        if index_mode {
+            Task::perform(
+                async move { scan_indexed(path, delimiter, pattern, indexes, limit) },
+                move |result| Message::ScanFinished(generation, result),
+            )
+        } else {
+            Task::perform(
+                async move {
+                    scan(
+                        path,
+                        delimiter,
+                        pattern,
+                        case_sensitive,
+                        limit,
+                        visible,
+                        parallel,
+                    )
+                },
+                move |result| Message::ScanFinished(generation, result),
+            )
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -603,6 +711,36 @@ impl Viewer {
             Message::ToggleParallel(checked) => {
                 self.parallel = checked;
                 self.start_scan()
+            }
+            Message::ToggleTable(checked) => {
+                self.table = checked;
+                Task::none()
+            }
+            Message::ToggleUseIndex(checked) => {
+                self.use_index = checked;
+                self.start_scan()
+            }
+            Message::ToggleIndex(column) => {
+                if self.indexes.remove(&column).is_some() {
+                    self.index_status = Some(format!("dropped index on “{}”", self.header(column)));
+                    // The search falls back to the regex now.
+                    self.start_scan()
+                } else if self.indexing {
+                    self.index_status = Some("an index build is already running".into());
+                    Task::none()
+                } else if let Some(path) = self.path.clone() {
+                    self.indexing = true;
+                    self.index_status =
+                        Some(format!("indexing “{}”…", self.header(column)));
+                    let delimiter = self.delimiter;
+                    let built_path = path.clone();
+                    Task::perform(
+                        async move { build_index(path, delimiter, column) },
+                        move |result| Message::IndexBuilt(column, built_path.clone(), result),
+                    )
+                } else {
+                    Task::none()
+                }
             }
             Message::Mute(index) => {
                 self.muted.insert(index);
@@ -694,6 +832,7 @@ impl Viewer {
                         self.matched = scan.matched;
                         self.truncated = scan.truncated;
                         self.rows_read = scan.rows_read;
+                        self.indexed_result = scan.indexed;
                         self.error = None;
                     }
                     Err(message) => self.error = Some(message),
@@ -715,7 +854,48 @@ impl Viewer {
                     reset
                 }
             }
+            Message::IndexBuilt(column, path, result) => {
+                // The file may have been switched while the index was building;
+                // the offsets would be meaningless, so drop the result.
+                if self.path.as_deref() != Some(path.as_path()) {
+                    return Task::none();
+                }
+                self.indexing = false;
+                match result {
+                    Ok(index) => {
+                        let count = index.entries.len();
+                        let name = self.header(column).to_string();
+                        self.indexes.insert(column, Arc::new(index));
+                        self.index_status =
+                            Some(format!("indexed “{name}” ({count} rows)"));
+                        // Re-run the search: the index now serves a prefix query.
+                        self.start_scan()
+                    }
+                    Err(message) => {
+                        self.index_status = Some(message);
+                        Task::none()
+                    }
+                }
+            }
         }
+    }
+
+    /// The header of a column, or `?` when the index is out of range.
+    fn header(&self, column: usize) -> &str {
+        self.headers.get(column).map(String::as_str).unwrap_or("?")
+    }
+
+    /// Whether the search is currently served by the built indexes (a
+    /// `beginsWith` prefix query) rather than the regex: at least one searched
+    /// column is indexed, index search is enabled, and case-sensitive mode has
+    /// not forced the regex path.
+    fn index_mode(&self) -> bool {
+        self.use_index
+            && !self.case_sensitive
+            && self
+                .indexes
+                .keys()
+                .any(|column| !self.visible_only || !self.muted.contains(column))
     }
 
     /// Muting an attribute changes which columns are searched when the
@@ -790,7 +970,12 @@ impl Viewer {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let filter = text_input("regex filter, e.g. \\d{4}-\\d{2}", &self.filter)
+        let filter_hint = if self.index_mode() {
+            "beginsWith prefix over indexed columns, e.g. Fra"
+        } else {
+            "regex filter, e.g. \\d{4}-\\d{2}"
+        };
+        let filter = text_input(filter_hint, &self.filter)
             .on_input(Message::FilterChanged)
             .on_submit(Message::RunFilter)
             .padding(8)
@@ -826,18 +1011,26 @@ impl Viewer {
                 self.matched,
                 self.rows_read,
                 self.truncated,
+                self.indexed_result,
             ))
             .into()
         };
 
-        // Opt-in scan modes: skip hidden columns, or read the whole file in
-        // parallel (exact totals, no early exit).
+        // Opt-in scan modes: skip hidden columns, read the whole file in
+        // parallel, render as a table, or use the built column indexes for a
+        // `beginsWith` search.
         let options = row![
             checkbox("visible only", self.visible_only)
                 .on_toggle(Message::ToggleVisibleOnly)
                 .text_size(12),
             checkbox("parallel", self.parallel)
                 .on_toggle(Message::ToggleParallel)
+                .text_size(12),
+            checkbox("table", self.table)
+                .on_toggle(Message::ToggleTable)
+                .text_size(12),
+            checkbox("index", self.use_index)
+                .on_toggle_maybe((!self.indexes.is_empty()).then_some(Message::ToggleUseIndex))
                 .text_size(12),
         ]
         .spacing(10)
@@ -955,6 +1148,9 @@ impl Viewer {
         if let Some(status) = &self.profile_status {
             controls = controls.push(text(status.as_str()).size(12));
         }
+        if let Some(status) = &self.index_status {
+            controls = controls.push(text(status.as_str()).size(12));
+        }
         hidden_bar = hidden_bar.push(controls);
 
         // Prompt for the name of a new profile.
@@ -1026,7 +1222,23 @@ impl Viewer {
                         )
                         .on_press(Message::Unmute(index))
                         .padding([3, 8])
-                        .style(button::secondary),
+                        .style({
+                            let indexed = self.indexes.contains_key(&index);
+                            move |theme: &Theme, status| {
+                                if indexed {
+                                    let palette = theme.extended_palette();
+                                    button::Style {
+                                        background: Some(Background::Color(
+                                            palette.success.weak.color,
+                                        )),
+                                        text_color: palette.success.strong.color,
+                                        ..button::secondary(theme, status)
+                                    }
+                                } else {
+                                    button::secondary(theme, status)
+                                }
+                            }
+                        }),
                     );
                     count += 1;
                     shown += 1;
@@ -1041,6 +1253,22 @@ impl Viewer {
         }
 
         let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
+        let visible_columns: Vec<usize> = (0..self.headers.len())
+            .filter(|index| !self.muted.contains(index))
+            .collect();
+
+        // Table geometry: each column keeps at least `TABLE_CELL_MIN_WIDTH`, so
+        // the table grows horizontally instead of squeezing columns into the
+        // window. `show_table` is false when there is nothing to tabulate.
+        let show_table = self.table && !all_hidden && !self.headers.is_empty();
+        let column_widths: Vec<f32> = visible_columns
+            .iter()
+            .map(|&column| {
+                (self.header(column).chars().count() as f32 * CHAR_WIDTH + 24.0)
+                    .max(TABLE_CELL_MIN_WIDTH)
+            })
+            .collect();
+        let table_width: f32 = column_widths.iter().sum::<f32>().max(1.0);
 
         let mut list = column![].spacing(0).padding(0);
         if self.rows.is_empty() {
@@ -1059,20 +1287,18 @@ impl Viewer {
                 .padding(12),
             );
         } else {
-            // Virtual scrolling: only the stripes intersecting the viewport (plus
-            // a small overscan) are built, so a long list costs the same per frame
-            // as a short one. Every stripe is given the same fixed height, which
+            // Virtual scrolling: only the rows intersecting the viewport (plus a
+            // small overscan) are built, so a long list costs the same per frame
+            // as a short one. Every row is given the same fixed height, which
             // keeps the computed offsets exact.
-            let visible_headers = self
-                .headers
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !self.muted.contains(index))
-                .count();
-            let line_count = visible_headers.div_ceil(columns).max(1);
-            let row_height = stripe_height(line_count);
             let total_rows = self.rows.len();
             let viewport = self.viewport_height.max(1.0);
+            let row_height = if show_table {
+                TABLE_ROW_HEIGHT
+            } else {
+                let line_count = visible_columns.len().div_ceil(columns).max(1);
+                stripe_height(line_count)
+            };
 
             let first = ((self.scroll_offset / row_height).floor() as usize)
                 .saturating_sub(OVERSCAN_ROWS)
@@ -1083,14 +1309,69 @@ impl Viewer {
                 .min(total_rows)
                 .max(first);
 
+            // The header lives inside the scrolled content so it stays aligned
+            // when the table scrolls horizontally.
+            if show_table {
+                let mut header_line = Row::new().spacing(0);
+                for (column_position, &column) in visible_columns.iter().enumerate() {
+                    // The header doubles as the index toggle, mirroring the
+                    // indexed chip in the chip view.
+                    let indexed = self.indexes.contains_key(&column);
+                    header_line = header_line.push(
+                        button(text(self.header(column)).size(13))
+                            .on_press(Message::ToggleIndex(column))
+                            .width(Length::Fixed(column_widths[column_position]))
+                            .padding([5, 6])
+                            .style(move |theme: &Theme, _status| {
+                                let palette = theme.extended_palette();
+                                let background = if indexed {
+                                    Some(Background::Color(palette.success.weak.color))
+                                } else {
+                                    Some(Background::Color(palette.background.weak.color))
+                                };
+                                button::Style {
+                                    background,
+                                    text_color: palette.background.base.text,
+                                    ..button::Style::default()
+                                }
+                            }),
+                    );
+                }
+                list = list.push(
+                    container(header_line)
+                        .width(Length::Fixed(table_width))
+                        .style(stripe_style(true)),
+                );
+            }
+
             if first > 0 {
                 list = list.push(Space::with_height(Length::Fixed(
                     first as f32 * row_height,
                 )));
             }
 
-            for (position, values) in self.rows[first..last].iter().enumerate() {
-                let index = first + position;
+            for (offset, values) in self.rows[first..last].iter().enumerate() {
+                let index = first + offset;
+                if show_table {
+                    let mut line = Row::new().spacing(0);
+                    for (column_position, &column) in visible_columns.iter().enumerate() {
+                        let cell = values.get(column).map(String::as_str).unwrap_or("");
+                        line = line.push(
+                            container(text(cell).size(13).wrapping(Wrapping::None))
+                                .width(Length::Fixed(column_widths[column_position]))
+                                .clip(true)
+                                .padding([3, 6]),
+                        );
+                    }
+                    list = list.push(
+                        container(line)
+                            .width(Length::Fixed(table_width))
+                            .height(Length::Fixed(row_height))
+                            .clip(true)
+                            .style(stripe_style(index % 2 == 1)),
+                    );
+                    continue;
+                }
                 let visible: Vec<usize> = (0..values.len())
                     .filter(|column| !self.muted.contains(column))
                     .collect();
@@ -1098,9 +1379,17 @@ impl Viewer {
                 for chunk in visible.chunks(columns) {
                     let mut line = Row::new().spacing(CHIP_SPACING);
                     for &column in chunk {
-                        let header = self.headers.get(column).map(String::as_str).unwrap_or("?");
+                        let header = self.header(column);
                         let highlight = attr_matches(&self.attribute_filter, header);
-                        line = line.push(chip(header, &values[column], column, chip_max, highlight));
+                        let indexed = self.indexes.contains_key(&column);
+                        line = line.push(chip(
+                            header,
+                            &values[column],
+                            column,
+                            chip_max,
+                            highlight,
+                            indexed,
+                        ));
                     }
                     // Clip each chip line to a fixed height so a very long value
                     // cannot make one stripe taller than the rest.
@@ -1127,6 +1416,18 @@ impl Viewer {
             }
         }
 
+        // Table mode scrolls both ways: the columns keep a comfortable width and
+        // the table grows horizontally rather than being squeezed into the
+        // window.
+        let direction = if show_table {
+            scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            }
+        } else {
+            scrollable::Direction::Vertical(scrollable::Scrollbar::default())
+        };
+
         column![
             top,
             status_bar,
@@ -1135,6 +1436,7 @@ impl Viewer {
             scrollable(list)
                 .id(self.scroll_id.clone())
                 .on_scroll(Message::Scrolled)
+                .direction(direction)
                 .height(Fill)
                 .width(Fill)
         ]
@@ -1172,10 +1474,21 @@ fn stripe_style(active: bool) -> impl Fn(&Theme) -> container::Style {
 
 /// Chip style: a transparent background (the row color shows through) with a
 /// border, so a chip never blends into the plain or the striped row background.
-/// Highlighted chips (those matching the attribute filter) get an accent
-/// background and border.
-fn chip_style(theme: &Theme, highlight: bool) -> container::Style {
+/// Chips whose attribute is **indexed** get a success accent, and chips matching
+/// the attribute filter get the primary accent.
+fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style {
     let palette = theme.extended_palette();
+    if indexed {
+        return container::Style {
+            background: Some(Background::Color(palette.success.weak.color)),
+            border: Border {
+                color: palette.success.strong.color,
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        };
+    }
     if highlight {
         return container::Style {
             background: Some(Background::Color(palette.primary.weak.color)),
@@ -1198,14 +1511,17 @@ fn chip_style(theme: &Theme, highlight: bool) -> container::Style {
     }
 }
 
-/// A single `attribute = value` chip with a mute icon. `highlight` marks chips
-/// whose attribute name matches the attribute filter.
+/// A single `attribute = value` chip with an index toggle and a mute icon.
+/// `highlight` marks chips whose attribute name matches the attribute filter;
+/// `indexed` marks attributes with a built prefix index and switches the icon
+/// from an outline to a filled database.
 fn chip<'a>(
     header: &'a str,
     value: &'a str,
     index: usize,
     max_width: f32,
     highlight: bool,
+    indexed: bool,
 ) -> Element<'a, Message> {
     let label_text = format!("{header} = {value}");
     let content_width = (max_width - CHIP_CHROME).max(60.0);
@@ -1218,14 +1534,24 @@ fn chip<'a>(
         text(label_text).size(13)
     };
 
+    let database = if indexed {
+        Bootstrap::DatabaseFill
+    } else {
+        Bootstrap::Database
+    };
+    let toggle_index = button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
+        .on_press(Message::ToggleIndex(index))
+        .padding(2)
+        .style(button::text);
+
     let mute = button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
         .on_press(Message::Mute(index))
         .padding(2)
         .style(button::text);
 
-    container(row![label, mute].spacing(6).align_y(Center))
+    container(row![label, toggle_index, mute].spacing(6).align_y(Center))
         .padding([3, 8])
-        .style(move |theme| chip_style(theme, highlight))
+        .style(move |theme| chip_style(theme, highlight, indexed))
         .into()
 }
 
@@ -1394,6 +1720,7 @@ fn scan_sequential(
         matched,
         truncated,
         rows_read,
+        indexed: false,
     })
 }
 
@@ -1505,6 +1832,108 @@ fn scan_parallel(
         matched,
         truncated,
         rows_read,
+        indexed: false,
+    })
+}
+
+/// Build a prefix index for one column: one `(lowercased value, row byte offset)`
+/// entry per data row, then sorted by value. Runs on a background thread.
+fn build_index(path: PathBuf, delimiter: u8, column: usize) -> Result<ColumnIndex, String> {
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ColumnIndex {
+            entries: Vec::new(),
+        });
+    };
+    let bytes: &[u8] = &mmap;
+
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(true)
+        .flexible(true);
+    let mut reader = builder.from_reader(bytes);
+    reader
+        .byte_headers()
+        .map_err(|e| format!("error reading CSV headers: {e}"))?;
+
+    let mut record = ByteRecord::new();
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    loop {
+        // `position` is the start of the record that is about to be read; after
+        // `byte_headers` it points at the first data row.
+        let offset = reader.position();
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV: {e}")),
+        }
+        let value = record
+            .get(column)
+            .map(|cell| String::from_utf8_lossy(cell).to_lowercase())
+            .unwrap_or_default();
+        entries.push((value, offset));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ColumnIndex { entries })
+}
+
+/// Read the row starting at each byte offset, in the given order, up to `limit`.
+fn rows_at_offsets(
+    bytes: &[u8],
+    delimiter: u8,
+    offsets: &[u64],
+    limit: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    let mut rows = Vec::new();
+    let mut record = ByteRecord::new();
+    for &offset in offsets.iter().take(limit) {
+        let slice = bytes.get(offset as usize..).unwrap_or_default();
+        let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+        builder
+            .delimiter(delimiter)
+            .has_headers(false)
+            .flexible(true);
+        let mut reader = builder.from_reader(slice);
+        match reader.read_byte_record(&mut record) {
+            Ok(true) => rows.push(collect_row(&record)),
+            Ok(false) => {}
+            Err(e) => return Err(format!("error reading CSV row: {e}")),
+        }
+    }
+    Ok(rows)
+}
+
+/// Prefix ("beginsWith") search served by the built column indexes. The set of
+/// matching rows is known from the indexes, so no file scan is needed and the
+/// totals are exact.
+fn scan_indexed(
+    path: PathBuf,
+    delimiter: u8,
+    prefix: String,
+    indexes: Vec<Arc<ColumnIndex>>,
+    limit: usize,
+) -> Result<ScanResult, String> {
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ScanResult::empty());
+    };
+    let bytes: &[u8] = &mmap;
+
+    let mut offsets: Vec<u64> = Vec::new();
+    for index in &indexes {
+        offsets.extend(index.prefix_offsets(&prefix));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let matched = offsets.len();
+    let rows = rows_at_offsets(bytes, delimiter, &offsets, limit)?;
+    let truncated = matched > rows.len();
+    Ok(ScanResult {
+        rows,
+        matched,
+        truncated,
+        rows_read: matched,
+        indexed: true,
     })
 }
 
@@ -1578,19 +2007,25 @@ mod tests {
     #[test]
     fn status_text_reports_rows_read() {
         assert_eq!(
-            status_text(100, 100, 101, true),
+            status_text(100, 100, 101, true, false),
             "showing first 100 matching rows (more available) · 101 rows read"
         );
         // A full scan knows the exact match total, so it can name it.
         assert_eq!(
-            status_text(100, 714, 5000, true),
+            status_text(100, 714, 5000, true, false),
             "showing first 100 of 714 matching rows · 5000 rows read"
         );
         assert_eq!(
-            status_text(7, 7, 500, false),
+            status_text(7, 7, 500, false, false),
             "7 matching rows of 500 total"
         );
-        assert_eq!(status_text(500, 500, 500, false), "500 rows");
+        assert_eq!(status_text(500, 500, 500, false, false), "500 rows");
+        // Index results are exact and never read the file.
+        assert_eq!(
+            status_text(100, 714, 714, true, true),
+            "showing first 100 of 714 matching rows (index prefix)"
+        );
+        assert_eq!(status_text(7, 7, 7, false, true), "7 matching rows (index prefix)");
     }
 
     #[test]
@@ -1679,6 +2114,73 @@ mod tests {
         assert_eq!(parallel.rows_read, 5000);
         assert_eq!(parallel.matched, (0..5000).filter(|i| i % 7 == 3).count());
         assert!(parallel.truncated);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn index_prefix_search_returns_file_order_offsets() {
+        let index = ColumnIndex {
+            entries: vec![
+                ("apple".into(), 30),
+                ("apricot".into(), 10),
+                ("banana".into(), 20),
+            ],
+        };
+        // Entries are sorted by value, so the result is re-sorted by position.
+        assert_eq!(index.prefix_offsets("ap"), vec![10, 30]);
+        assert_eq!(index.prefix_offsets("ban"), vec![20]);
+        // Matching is case-insensitive.
+        assert_eq!(index.prefix_offsets("APPLE"), vec![30]);
+        assert!(index.prefix_offsets("zzz").is_empty());
+    }
+
+    #[test]
+    fn build_index_offsets_resolve_to_the_right_rows() {
+        let path = std::env::temp_dir().join(format!("fview-index-{}.csv", std::process::id()));
+        std::fs::write(&path, "name,city\nAlice,Paris\nBob,Lyon\nAnna,Nice\n").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let index = build_index(path.clone(), b',', 0).unwrap();
+        // Sorted by lowercased value: "alice", "anna", "bob".
+        let offsets = index.prefix_offsets("an");
+        assert_eq!(offsets.len(), 1);
+        let rows = rows_at_offsets(&bytes, b',', &offsets, 10).unwrap();
+        assert_eq!(rows, vec![vec!["Anna".to_string(), "Nice".to_string()]]);
+
+        // A broader prefix returns every matching row in file order.
+        let offsets = index.prefix_offsets("a");
+        let rows = rows_at_offsets(&bytes, b',', &offsets, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "Alice");
+        assert_eq!(rows[1][0], "Anna");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_indexed_uses_a_prefix_query_over_the_indexed_column() {
+        let path = std::env::temp_dir().join(format!("fview-scanidx-{}.csv", std::process::id()));
+        std::fs::write(&path, "name,city\nAlice,Paris\nBob,Lyon\nAnna,Nice\n").unwrap();
+
+        let index = Arc::new(build_index(path.clone(), b',', 0).unwrap());
+        let result = scan_indexed(
+            path.clone(),
+            b',',
+            "An".into(),
+            vec![Arc::clone(&index)],
+            10,
+        )
+        .unwrap();
+        assert!(result.indexed);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.rows, vec![vec!["Anna".to_string(), "Nice".to_string()]]);
+
+        // Prefix search anchors at the start: "li" occurs in "Alice" but no
+        // indexed value starts with it.
+        let none = scan_indexed(path.clone(), b',', "li".into(), vec![index], 10).unwrap();
+        assert_eq!(none.matched, 0);
+        assert!(none.rows.is_empty());
 
         let _ = std::fs::remove_file(&path);
     }

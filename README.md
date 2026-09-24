@@ -398,7 +398,25 @@ and row totals (e.g. `showing first 100 of 714 matching rows · 5000 rows
 read`). Otherwise the status line reports how many rows
 were read, and, once the whole file has been read, the total row count (e.g.
 `7 matching rows of 500 total`, or just `500 rows` when every read row
-matched). Chips wrap based on the window width
+matched).
+
+A **table** checkbox switches the view from chips to a table of the visible
+attributes, with a header row. Columns keep a comfortable minimum width, so a
+wide table grows horizontally and scrolls sideways instead of squeezing the
+columns into the window. The filter's placeholder follows the mode: it reads
+`regex filter, …` normally and `beginsWith prefix over indexed columns, …`
+once index search is active. Each chip carries a small **database button**
+that builds (or drops) a prefix **index** for that attribute; indexed attributes
+are highlighted (green background and a filled database icon) in both the chip
+and table views. While at least one index exists and the **index** checkbox is
+on, a non-empty filter is interpreted as a case-insensitive `beginsWith` prefix
+query against the indexed columns: it is answered straight from the index (no
+file scan, exact totals, and the status line says `(index prefix)`), and the
+results appear in file order. Unchecking **index**, using `--case-sensitive`, or
+dropping a column's index returns the search to the regex. Indexes are built in
+the background, kept in memory for the current file, and dropped when another
+file is opened; building one is a full pass, so it pays off across repeated
+prefix searches on the same file. Chips wrap based on the window width
 (tracked via resize events) and the hidden-attribute chips wrap too. The row
 list is **virtualized**: only the stripes intersecting the viewport (plus a
 small overscan) are built each frame, so scrolling stays smooth no matter how
