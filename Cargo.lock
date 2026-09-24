@@ -1085,6 +1085,7 @@ dependencies = [
  "dirs",
  "iced",
  "iced_fonts",
+ "memmap2",
  "rayon",
  "regex",
  "rfd",

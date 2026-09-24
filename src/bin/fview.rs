@@ -23,28 +23,43 @@
 //!   with a mute icon that hides that attribute from all rows and moves its name
 //!   into the top bar.
 //!
+//! Scanning: the filter is **debounced** (a scan starts ~180 ms after the last
+//! keystroke, and an unchanged pattern is never re-scanned). The file is
+//! memory-mapped read-only. Two opt-in checkboxes in the top bar change the
+//! scan: **visible only** searches just the attributes that are currently
+//! shown, and **parallel** reads the whole file in record-aligned segments
+//! across all cores, which yields exact row/match totals but never exits early.
+//!
 //! Profiles: the set of currently visible attributes can be saved under a name
 //! and re-applied later. Profiles are persisted as TOML in the platform config
 //! directory (`<config>/fview/profiles.toml`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, horizontal_rule, pick_list, row, scrollable, text, text_input, Row,
-    Space,
+    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, text,
+    text_input, Row, Space,
 };
 use iced::{Background, Border, Center, Element, Fill, Length, Subscription, Task, Theme};
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
-use regex::RegexBuilder;
+use memmap2::Mmap;
+use rayon::prelude::*;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use simd_csv::ByteRecord;
 
 const BUFFER_CAPACITY: usize = 64 * 1024;
+/// How often the debounce timer is polled while a filter edit is pending.
+const DEBOUNCE_TICK_MS: u64 = 50;
+/// Quiet period after the last filter keystroke before a scan is started.
+const DEBOUNCE_QUIET_MS: u64 = 180;
 /// Spacing between chips, in px.
 const CHIP_SPACING: f32 = 8.0;
 /// Non-text width of a chip: padding + mute icon + inner spacing.
@@ -106,10 +121,25 @@ enum Backend {
 #[derive(Debug, Clone)]
 struct ScanResult {
     rows: Vec<Vec<String>>,
+    /// Best known number of matching data rows. Exact after a full (parallel)
+    /// scan; after an early-exiting sequential scan this is the number of kept
+    /// rows, since the true total was never read.
+    matched: usize,
     truncated: bool,
     /// Number of data rows actually read from the file. When `truncated` is
     /// false this is the total number of rows in the file.
     rows_read: usize,
+}
+
+impl ScanResult {
+    fn empty() -> Self {
+        ScanResult {
+            rows: Vec::new(),
+            matched: 0,
+            truncated: false,
+            rows_read: 0,
+        }
+    }
 }
 
 /// A named set of visible attributes.
@@ -179,9 +209,13 @@ fn hidden_note(count: usize) -> String {
 /// Status line for the current scan. `rows_read` is the number of data rows
 /// read; when the scan was not truncated it is the total number of rows in the
 /// file.
-fn status_text(matched: usize, rows_read: usize, truncated: bool) -> String {
+fn status_text(shown: usize, matched: usize, rows_read: usize, truncated: bool) -> String {
     if truncated {
-        format!("showing first {matched} matching rows (more available) · {rows_read} rows read")
+        if matched > shown {
+            format!("showing first {shown} of {matched} matching rows · {rows_read} rows read")
+        } else {
+            format!("showing first {shown} matching rows (more available) · {rows_read} rows read")
+        }
     } else if matched == rows_read {
         format!("{rows_read} rows")
     } else {
@@ -223,6 +257,12 @@ enum Message {
     FileChosen(Option<PathBuf>),
     FilterChanged(String),
     RunFilter,
+    /// Fired by the debounce timer; starts a scan once typing has paused.
+    DebounceTick,
+    /// Search only the attributes that are currently visible.
+    ToggleVisibleOnly(bool),
+    /// Use the parallel, full-file scan instead of the sequential early-exit one.
+    ToggleParallel(bool),
     /// Hide an attribute (column index) from the rows.
     Mute(usize),
     /// Show a previously hidden attribute again.
@@ -266,11 +306,24 @@ struct Viewer {
     filter: String,
     rows: Vec<Vec<String>>,
     truncated: bool,
+    /// Best known total number of matching rows from the last scan.
+    matched: usize,
     /// Number of data rows read by the last completed scan.
     rows_read: usize,
     error: Option<String>,
     scanning: bool,
     dirty: bool,
+    /// Filter text used when the last scan was started, so a redundant rescan
+    /// of an unchanged pattern is skipped.
+    last_scanned: Option<String>,
+    /// Whether a filter edit is waiting out the debounce quiet period.
+    debounce_pending: bool,
+    /// Time of the last filter keystroke, used by the debounce timer.
+    last_edit: Option<Instant>,
+    /// Search only the currently visible attributes (skips hidden ones).
+    visible_only: bool,
+    /// Use the parallel full-file scan instead of the sequential early-exit one.
+    parallel: bool,
     generation: u64,
     window_width: f32,
     /// Stable id of the row scrollable, so the view can jump back to the top.
@@ -308,10 +361,16 @@ impl Viewer {
             filter: String::new(),
             rows: Vec::new(),
             truncated: false,
+            matched: 0,
             rows_read: 0,
             error: None,
             scanning: false,
             dirty: false,
+            last_scanned: None,
+            debounce_pending: false,
+            last_edit: None,
+            visible_only: false,
+            parallel: false,
             generation: 0,
             window_width: 1200.0,
             scroll_id: scrollable::Id::unique(),
@@ -355,7 +414,11 @@ impl Viewer {
         self.dirty = false;
         self.rows.clear();
         self.truncated = false;
+        self.matched = 0;
         self.rows_read = 0;
+        self.last_scanned = None;
+        self.debounce_pending = false;
+        self.last_edit = None;
         self.muted.clear();
         self.show_hidden = false;
         self.error = None;
@@ -468,9 +531,32 @@ impl Viewer {
         let pattern = self.filter.clone();
         let case_sensitive = self.case_sensitive;
         let limit = self.limit;
+        let parallel = self.parallel;
+        // When enabled, only the columns that are currently visible are
+        // searched; hidden attributes are skipped entirely.
+        let visible = if self.visible_only {
+            Some(
+                (0..self.headers.len())
+                    .map(|index| !self.muted.contains(&index))
+                    .collect::<Vec<bool>>(),
+            )
+        } else {
+            None
+        };
+        self.last_scanned = Some(pattern.clone());
 
         Task::perform(
-            async move { scan(path, delimiter, pattern, case_sensitive, limit) },
+            async move {
+                scan(
+                    path,
+                    delimiter,
+                    pattern,
+                    case_sensitive,
+                    limit,
+                    visible,
+                    parallel,
+                )
+            },
             move |result| Message::ScanFinished(generation, result),
         )
     }
@@ -481,29 +567,62 @@ impl Viewer {
             Message::FileChosen(Some(path)) => self.load_file(path),
             Message::FileChosen(None) => Task::none(),
             Message::FilterChanged(value) => {
+                // Do not scan on every keystroke: record the edit and let the
+                // debounce timer start a single scan once typing pauses.
                 self.filter = value;
+                self.last_edit = Some(Instant::now());
+                self.debounce_pending = true;
+                Task::none()
+            }
+            Message::DebounceTick => {
+                if !self.debounce_pending {
+                    return Task::none();
+                }
+                let quiet = self
+                    .last_edit
+                    .map(|at| at.elapsed() >= Duration::from_millis(DEBOUNCE_QUIET_MS))
+                    .unwrap_or(true);
+                if !quiet {
+                    return Task::none();
+                }
+                self.debounce_pending = false;
+                // Skip the scan entirely when the pattern did not change.
+                if self.last_scanned.as_deref() == Some(self.filter.as_str()) {
+                    return Task::none();
+                }
                 self.start_scan()
             }
-            Message::RunFilter => self.start_scan(),
+            Message::RunFilter => {
+                self.debounce_pending = false;
+                self.start_scan()
+            }
+            Message::ToggleVisibleOnly(checked) => {
+                self.visible_only = checked;
+                self.start_scan()
+            }
+            Message::ToggleParallel(checked) => {
+                self.parallel = checked;
+                self.start_scan()
+            }
             Message::Mute(index) => {
                 self.muted.insert(index);
                 self.profile_status = None;
-                Task::none()
+                self.rescan_if_searching_visible()
             }
             Message::Unmute(index) => {
                 self.muted.remove(&index);
                 self.profile_status = None;
-                Task::none()
+                self.rescan_if_searching_visible()
             }
             Message::UnmuteAll => {
                 self.muted.clear();
                 self.profile_status = None;
-                Task::none()
+                self.rescan_if_searching_visible()
             }
             Message::MuteAll => {
                 self.muted = (0..self.headers.len()).collect();
                 self.profile_status = None;
-                Task::none()
+                self.rescan_if_searching_visible()
             }
             Message::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
@@ -572,6 +691,7 @@ impl Viewer {
                 match result {
                     Ok(scan) => {
                         self.rows = scan.rows;
+                        self.matched = scan.matched;
                         self.truncated = scan.truncated;
                         self.rows_read = scan.rows_read;
                         self.error = None;
@@ -585,7 +705,10 @@ impl Viewer {
                     self.scroll_id.clone(),
                     AbsoluteOffset { x: 0.0, y: 0.0 },
                 );
-                if self.dirty {
+                // Re-scan when a mute change or a filter edit landed while the
+                // scan was running.
+                let stale = self.last_scanned.as_deref() != Some(self.filter.as_str());
+                if self.dirty || stale {
                     self.dirty = false;
                     Task::batch([reset, self.start_scan()])
                 } else {
@@ -595,9 +718,28 @@ impl Viewer {
         }
     }
 
+    /// Muting an attribute changes which columns are searched when the
+    /// visible-only mode is on, so that mode needs the results recomputed.
+    fn rescan_if_searching_visible(&mut self) -> Task<Message> {
+        if self.visible_only {
+            self.start_scan()
+        } else {
+            Task::none()
+        }
+    }
+
     fn subscription(&self) -> Subscription<Message> {
-        iced::window::resize_events()
-            .map(|(_id, size)| Message::Resized(size.width, size.height))
+        let resize = iced::window::resize_events()
+            .map(|(_id, size)| Message::Resized(size.width, size.height));
+        // Poll only while an edit is pending; the handler waits for the quiet
+        // period before starting the scan, which debounces typing bursts.
+        let debounce = if self.debounce_pending {
+            iced::time::every(Duration::from_millis(DEBOUNCE_TICK_MS))
+                .map(|_| Message::DebounceTick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([resize, debounce])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -679,8 +821,27 @@ impl Viewer {
         } else if self.scanning {
             text("scanning…").into()
         } else {
-            text(status_text(self.rows.len(), self.rows_read, self.truncated)).into()
+            text(status_text(
+                self.rows.len(),
+                self.matched,
+                self.rows_read,
+                self.truncated,
+            ))
+            .into()
         };
+
+        // Opt-in scan modes: skip hidden columns, or read the whole file in
+        // parallel (exact totals, no early exit).
+        let options = row![
+            checkbox("visible only", self.visible_only)
+                .on_toggle(Message::ToggleVisibleOnly)
+                .text_size(12),
+            checkbox("parallel", self.parallel)
+                .on_toggle(Message::ToggleParallel)
+                .text_size(12),
+        ]
+        .spacing(10)
+        .align_y(Center);
 
         let top = row![
             open,
@@ -688,11 +849,15 @@ impl Viewer {
             text("Filter:").size(15),
             filter,
             search,
-            status
+            options,
         ]
         .spacing(10)
         .align_y(Center)
         .padding(10);
+
+        // The status gets its own line so a long message cannot squeeze the
+        // filter field in the bar above.
+        let status_bar = container(status).padding([0.0, 10.0]);
 
         // Hidden attributes live in the top bar; clicking restores them.
         let (columns, chip_max, hidden_columns) = chip_layout(self.window_width);
@@ -964,6 +1129,7 @@ impl Viewer {
 
         column![
             top,
+            status_bar,
             hidden_bar,
             horizontal_rule(1).style(divider_style),
             scrollable(list)
@@ -1086,14 +1252,69 @@ fn read_headers(path: &Path, delimiter: u8) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Memory-map a file read-only. Returns `None` for a zero-length file, which
+/// cannot be mapped.
+fn map_file(path: &Path) -> Result<Option<Mmap>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+    // SAFETY: the mapping is read-only and the viewer never writes to the
+    // mapped file while a scan is running.
+    let map = unsafe { Mmap::map(&file) }
+        .map_err(|e| format!("cannot memory-map {}: {e}", path.display()))?;
+    Ok(Some(map))
+}
+
+/// The predicate applied to each data row: an optional regex and an optional
+/// per-column mask. When the mask is set, only columns whose entry is `true`
+/// are tested (used to skip hidden attributes).
+struct Matcher<'a> {
+    regex: Option<&'a Regex>,
+    visible: Option<&'a [bool]>,
+}
+
+impl Matcher<'_> {
+    fn is_match(&self, record: &ByteRecord) -> bool {
+        let Some(regex) = self.regex else {
+            return true;
+        };
+        record.iter().enumerate().any(|(index, cell)| {
+            let searched = match self.visible {
+                Some(mask) => mask.get(index).copied().unwrap_or(false),
+                None => true,
+            };
+            searched && regex.is_match(&String::from_utf8_lossy(cell))
+        })
+    }
+}
+
+/// Copy a record into owned strings for display.
+fn collect_row(record: &ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
 /// Stream the whole file, count every match and keep the first `limit` rows.
 /// Runs on a background thread through `Task::perform`.
+///
+/// `parallel` selects the full-file segmented scan (exact totals, no early
+/// exit); otherwise the sequential scan stops as soon as `limit` rows matched.
+/// `visible` restricts the search to the columns whose entry is `true`.
 fn scan(
     path: PathBuf,
     delimiter: u8,
     pattern: String,
     case_sensitive: bool,
     limit: usize,
+    visible: Option<Vec<bool>>,
+    parallel: bool,
 ) -> Result<ScanResult, String> {
     let regex = if pattern.trim().is_empty() {
         None
@@ -1106,16 +1327,40 @@ fn scan(
         )
     };
 
-    let file = File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ScanResult::empty());
+    };
+    let bytes: &[u8] = &mmap;
+    let matcher = Matcher {
+        regex: regex.as_ref(),
+        visible: visible.as_deref(),
+    };
+
+    if parallel {
+        scan_parallel(bytes, delimiter, &matcher, limit)
+    } else {
+        scan_sequential(bytes, delimiter, &matcher, limit)
+    }
+}
+
+/// Sequential scan over the memory map. Stops as soon as `limit` rows matched,
+/// so the totals are only exact when the scan was not truncated.
+fn scan_sequential(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<ScanResult, String> {
     let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
     builder
         .delimiter(delimiter)
         .has_headers(true)
         .flexible(true);
-    let mut reader = builder.from_reader(file);
+    let mut reader = builder.from_reader(bytes);
 
     let mut record = ByteRecord::new();
     let mut rows = Vec::new();
+    let mut matched = 0usize;
     let mut truncated = false;
     let mut rows_read = 0usize;
 
@@ -1123,25 +1368,14 @@ fn scan(
         match reader.read_byte_record(&mut record) {
             Ok(false) => break,
             Ok(true) => {}
-            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
+            Err(e) => return Err(format!("error reading CSV: {e}")),
         }
         rows_read += 1;
 
-        let is_match = match &regex {
-            None => true,
-            Some(regex) => record
-                .iter()
-                .any(|cell| regex.is_match(&String::from_utf8_lossy(cell))),
-        };
-
-        if is_match {
+        if matcher.is_match(&record) {
+            matched += 1;
             if rows.len() < limit {
-                rows.push(
-                    record
-                        .iter()
-                        .map(|cell| String::from_utf8_lossy(cell).into_owned())
-                        .collect(),
-                );
+                rows.push(collect_row(&record));
             } else {
                 // Stop scanning: only the first `limit` matching rows are shown.
                 truncated = true;
@@ -1150,8 +1384,125 @@ fn scan(
         }
     }
 
+    if truncated {
+        // The exact total is unknown because the scan stopped early; report the
+        // rows that were actually kept.
+        matched = rows.len();
+    }
     Ok(ScanResult {
         rows,
+        matched,
+        truncated,
+        rows_read,
+    })
+}
+
+/// Record-aligned byte ranges for a parallel scan over a memory map.
+fn segments_for(bytes: &[u8], delimiter: u8, count: usize) -> Result<Vec<(u64, u64)>, String> {
+    let mut builder = simd_csv::SeekerBuilder::new();
+    builder.delimiter(delimiter).has_headers(true);
+    let seeker = builder
+        .from_reader(Cursor::new(bytes))
+        .map_err(|e| format!("cannot seek CSV: {e}"))?;
+    let Some(mut seeker) = seeker else {
+        return Ok(Vec::new());
+    };
+    let ranges = seeker
+        .segments(count.max(1))
+        .map_err(|e| format!("cannot split CSV: {e}"))?;
+    Ok(ranges.into_iter().filter(|(from, to)| to > from).collect())
+}
+
+/// Result of scanning one record-aligned segment.
+struct SegmentScan {
+    rows: Vec<Vec<String>>,
+    matched: usize,
+    rows_read: usize,
+}
+
+fn scan_segment(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    from: u64,
+    to: u64,
+    limit: usize,
+) -> Result<SegmentScan, String> {
+    let slice = bytes.get(from as usize..to as usize).unwrap_or_default();
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true);
+    let mut reader = builder.from_reader(slice);
+
+    let mut record = ByteRecord::new();
+    let mut rows = Vec::new();
+    let mut matched = 0usize;
+    let mut rows_read = 0usize;
+
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV segment: {e}")),
+        }
+        rows_read += 1;
+        if matcher.is_match(&record) {
+            matched += 1;
+            // Keep at most `limit` rows per segment: later segments can never
+            // contribute to the first `limit` rows in file order.
+            if rows.len() < limit {
+                rows.push(collect_row(&record));
+            }
+        }
+    }
+
+    Ok(SegmentScan {
+        rows,
+        matched,
+        rows_read,
+    })
+}
+
+/// Read the whole file in parallel, preserving file order for the rows shown.
+/// This never exits early, so `matched` and `rows_read` are exact totals.
+fn scan_parallel(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<ScanResult, String> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let segments = segments_for(bytes, delimiter, threads)?;
+    if segments.len() <= 1 {
+        // Too small to split: the sequential scan is equivalent.
+        return scan_sequential(bytes, delimiter, matcher, limit);
+    }
+
+    let per_segment: Vec<SegmentScan> = segments
+        .par_iter()
+        .map(|&(from, to)| scan_segment(bytes, delimiter, matcher, from, to, limit))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Merge in file order so the displayed rows keep the file's row order.
+    let mut rows = Vec::new();
+    let mut matched = 0usize;
+    let mut rows_read = 0usize;
+    for segment in per_segment {
+        matched += segment.matched;
+        rows_read += segment.rows_read;
+        if rows.len() < limit {
+            rows.extend(segment.rows.into_iter().take(limit - rows.len()));
+        }
+    }
+
+    let truncated = matched > rows.len();
+    Ok(ScanResult {
+        rows,
+        matched,
         truncated,
         rows_read,
     })
@@ -1227,11 +1578,19 @@ mod tests {
     #[test]
     fn status_text_reports_rows_read() {
         assert_eq!(
-            status_text(100, 101, true),
+            status_text(100, 100, 101, true),
             "showing first 100 matching rows (more available) · 101 rows read"
         );
-        assert_eq!(status_text(7, 500, false), "7 matching rows of 500 total");
-        assert_eq!(status_text(500, 500, false), "500 rows");
+        // A full scan knows the exact match total, so it can name it.
+        assert_eq!(
+            status_text(100, 714, 5000, true),
+            "showing first 100 of 714 matching rows · 5000 rows read"
+        );
+        assert_eq!(
+            status_text(7, 7, 500, false),
+            "7 matching rows of 500 total"
+        );
+        assert_eq!(status_text(500, 500, 500, false), "500 rows");
     }
 
     #[test]
@@ -1240,16 +1599,86 @@ mod tests {
         std::fs::write(&path, "a,b\n1,2\n3,4\n5,6\n").unwrap();
 
         // The limit is hit mid-file, so only part of it is read.
-        let limited = scan(path.clone(), b',', String::new(), false, 2).unwrap();
+        let limited = scan(path.clone(), b',', String::new(), false, 2, None, false).unwrap();
         assert_eq!(limited.rows.len(), 2);
+        assert_eq!(limited.matched, 2);
         assert!(limited.truncated);
         assert_eq!(limited.rows_read, 3);
 
         // A large enough limit reads the whole file.
-        let full = scan(path.clone(), b',', String::new(), false, 10).unwrap();
+        let full = scan(path.clone(), b',', String::new(), false, 10, None, false).unwrap();
         assert_eq!(full.rows.len(), 3);
+        assert_eq!(full.matched, 3);
         assert!(!full.truncated);
         assert_eq!(full.rows_read, 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_respects_the_visible_mask() {
+        let path = std::env::temp_dir().join(format!("fview-visible-{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\nfoo,x\nbar,foo\n").unwrap();
+
+        // Without a mask every column is searched: `foo` hits both rows.
+        let all = scan(path.clone(), b',', "foo".into(), false, 10, None, false).unwrap();
+        assert_eq!(all.rows.len(), 2);
+
+        // With column `b` hidden, row 2 (matched only via `b`) is skipped.
+        let masked = scan(
+            path.clone(),
+            b',',
+            "foo".into(),
+            false,
+            10,
+            Some(vec![true, false]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(masked.rows.len(), 1);
+        assert_eq!(masked.matched, 1);
+
+        // A pattern only present in the hidden column finds nothing.
+        let hidden_only = scan(
+            path.clone(),
+            b',',
+            "x".into(),
+            false,
+            10,
+            Some(vec![true, false]),
+            false,
+        )
+        .unwrap();
+        assert!(hidden_only.rows.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential_and_reports_exact_totals() {
+        let path =
+            std::env::temp_dir().join(format!("fview-parallel-{}.csv", std::process::id()));
+        let mut data = String::from("id,city\n");
+        for i in 0..5000 {
+            data.push_str(&format!("{i},city{}\n", i % 7));
+        }
+        std::fs::write(&path, data).unwrap();
+
+        // Guard the test: if the file cannot be split the parallel path falls
+        // back to the sequential one and the exact totals below are vacuous.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(segments_for(&bytes, b',', 4).unwrap().len() > 1);
+
+        let sequential =
+            scan(path.clone(), b',', "city3".into(), false, 10, None, false).unwrap();
+        let parallel = scan(path.clone(), b',', "city3".into(), false, 10, None, true).unwrap();
+
+        // Same rows, in the same (file) order.
+        assert_eq!(sequential.rows, parallel.rows);
+        // The full parallel scan reads everything and knows the exact totals.
+        assert_eq!(parallel.rows_read, 5000);
+        assert_eq!(parallel.matched, (0..5000).filter(|i| i % 7 == 3).count());
+        assert!(parallel.truncated);
 
         let _ = std::fs::remove_file(&path);
     }

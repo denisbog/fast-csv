@@ -344,7 +344,8 @@ fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_
 The crate also ships a second, **optional** binary that greps and browses rows
 of a big CSV file in a window. It depends on [`iced`](https://iced.rs) and
 [`rfd`](https://github.com/PolyMeilex/rfd) for the native file picker (plus
-`toml` and `dirs` for the profile store), all optional dependencies behind the
+`toml` and `dirs` for the profile store, and `memmap2` for the read-only file
+mapping), all optional dependencies behind the
 `gui` feature, so the default `fvalidate` build stays GUI-free.
 
 The viewer is **GPU-accelerated** by default: iced is built with both the
@@ -369,7 +370,9 @@ The file path is optional. Without it the window opens on a welcome screen with
 an **Open CSV…** button that opens a native file picker; an **Open…** button in
 the top bar lets you switch files at any time. The top bar contains a text field
 for a regex filter (the filter is applied to every cell, case-insensitively by
-default; Enter or **Search** re-runs it on a background thread). Each matching
+default; typing is **debounced**, so a background scan starts about 180 ms after
+the last keystroke, and an unchanged pattern is not re-scanned — Enter or
+**Search** runs it immediately). Each matching
 row is rendered as a set of `attribute = value` chips. Every chip has a **mute**
 icon (an eye-slash, embedded from Bootstrap Icons via `iced_fonts`, so it does
 not depend on system fonts) that hides that attribute from all rows; hidden
@@ -385,7 +388,14 @@ background colors, and chips use a transparent background with a border, so
 they never
 blend into the plain or the striped row. Only the **first 100 matching rows**
 are shown (`-n/--limit` to change it), and scanning stops once that many are
-found, so large files stay responsive. The status line reports how many rows
+found, so large files stay responsive. The file is memory-mapped read-only, so
+repeated searches reuse the page cache instead of re-reading it. Two opt-in
+checkboxes in the top bar change the scan: **visible only** searches just the
+attributes that are currently visible (skipping the hidden ones), and
+**parallel** reads the whole file in record-aligned segments across all cores;
+the parallel scan never exits early, so its status line reports **exact** match
+and row totals (e.g. `showing first 100 of 714 matching rows · 5000 rows
+read`). Otherwise the status line reports how many rows
 were read, and, once the whole file has been read, the total row count (e.g.
 `7 matching rows of 500 total`, or just `500 rows` when every read row
 matched). Chips wrap based on the window width

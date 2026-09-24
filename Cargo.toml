@@ -17,7 +17,7 @@ required-features = ["gui"]
 [features]
 default = []
 # Optional GUI viewer (grep + browse rows). Build with `cargo run --features gui --bin fview`.
-gui = ["dep:iced", "dep:rfd", "dep:iced_fonts", "dep:toml", "dep:dirs"]
+gui = ["dep:iced", "dep:rfd", "dep:iced_fonts", "dep:toml", "dep:dirs", "dep:memmap2"]
 
 [dependencies]
 simd-csv = "0.14"
@@ -36,6 +36,7 @@ iced = { version = "0.13", optional = true, default-features = false, features =
 ] }
 rfd = { version = "0.17", optional = true }
 iced_fonts = { version = "0.2", optional = true, default-features = false, features = ["bootstrap"] }
+memmap2 = { version = "0.9", optional = true }
 toml = { version = "0.8", optional = true }
 dirs = { version = "4", optional = true }
 
