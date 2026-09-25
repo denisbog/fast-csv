@@ -31,13 +31,15 @@
 //! across all cores, which yields exact row/match totals but never exits early.
 //!
 //! Display and indexing: a **table** checkbox renders the matches as a table of
-//! the visible attributes instead of chips. Each chip carries a database button
-//! that builds (or drops) a per-column prefix **index**; indexed attributes are
+//! the visible attributes instead of chips. Each chip, and each table header,
+//! carries a database button that builds (or drops) a per-column prefix
+//! **index** and a mute button that hides the attribute; indexed attributes are
 //! highlighted (green background, filled icon) in both views. While an index
 //! exists and the **index** checkbox is on, a non-empty filter becomes a
 //! case-insensitive `beginsWith` prefix query over the indexed columns — served
 //! straight from the index, with exact totals and no file scan. Unchecking
-//! **index** (or using `--case-sensitive`) falls back to the regex.
+//! **index** (or using `--case-sensitive`) falls back to the regex. Clicking a
+//! table row opens a form with every attribute of that row.
 //!
 //! Profiles: the set of currently visible attributes can be saved under a name
 //! and re-applied later. Profiles are persisted as TOML in the platform config
@@ -54,8 +56,8 @@ use clap::{Parser, ValueEnum};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, text,
-    text_input, Row, Space,
+    button, checkbox, column, container, horizontal_rule, opaque, pick_list, row, scrollable, stack,
+    text, text_input, Row, Space,
 };
 use iced::theme::Palette;
 use iced::{
@@ -340,6 +342,10 @@ enum Message {
     ToggleUseIndex(bool),
     /// Build or drop the prefix index for an attribute.
     ToggleIndex(usize),
+    /// Open the detail form for a matching row (index into `rows`).
+    RowClicked(usize),
+    /// Close the row detail form.
+    CloseDetail,
     /// Hide an attribute (column index) from the rows.
     Mute(usize),
     /// Show a previously hidden attribute again.
@@ -385,6 +391,9 @@ struct Viewer {
     show_hidden: bool,
     filter: String,
     rows: Vec<Vec<String>>,
+    /// Attribute/value snapshot of the row opened in the detail form, together
+    /// with its 0-based position in `rows` (for the title).
+    detail: Option<(usize, Vec<(String, String)>)>,
     truncated: bool,
     /// Best known total number of matching rows from the last scan.
     matched: usize,
@@ -452,6 +461,7 @@ impl Viewer {
             show_hidden: false,
             filter: String::new(),
             rows: Vec::new(),
+            detail: None,
             truncated: false,
             matched: 0,
             rows_read: 0,
@@ -511,6 +521,7 @@ impl Viewer {
         self.scanning = false;
         self.dirty = false;
         self.rows.clear();
+        self.detail = None;
         self.truncated = false;
         self.matched = 0;
         self.rows_read = 0;
@@ -752,6 +763,23 @@ impl Viewer {
                 } else {
                     Task::none()
                 }
+            }
+            Message::RowClicked(index) => {
+                // Snapshot the values so the form keeps showing this row even
+                // when a later scan replaces the visible matches.
+                let fields = self.rows.get(index).map(|values| {
+                    (0..values.len())
+                        .map(|column| (self.header(column).to_string(), values[column].clone()))
+                        .collect()
+                });
+                if let Some(fields) = fields {
+                    self.detail = Some((index, fields));
+                }
+                Task::none()
+            }
+            Message::CloseDetail => {
+                self.detail = None;
+                Task::none()
             }
             Message::Mute(index) => {
                 self.muted.insert(index);
@@ -1422,15 +1450,32 @@ impl Viewer {
             if show_table {
                 let mut header_line = Row::new().spacing(0);
                 for (column_position, &column) in visible_columns.iter().enumerate() {
-                    // The header doubles as the index toggle, mirroring the
-                    // indexed chip in the chip view.
+                    // The header itself is inert now: the database and mute
+                    // icons mirror the controls on the chip view.
                     let indexed = self.indexes.contains_key(&column);
-                    header_line = header_line.push(
-                        button(text(self.header(column)).size(13))
+                    let database = if indexed {
+                        Bootstrap::DatabaseFill
+                    } else {
+                        Bootstrap::Database
+                    };
+                    let cell = row![
+                        text(self.header(column)).size(13).width(Fill),
+                        button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
                             .on_press(Message::ToggleIndex(column))
+                            .padding(2)
+                            .style(ghost_button),
+                        button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
+                            .on_press(Message::Mute(column))
+                            .padding(2)
+                            .style(ghost_button),
+                    ]
+                    .spacing(4)
+                    .align_y(Center);
+                    header_line = header_line.push(
+                        container(cell)
                             .width(Length::Fixed(column_widths[column_position]))
                             .padding([5, 10])
-                            .style(table_header_style(indexed)),
+                            .style(move |theme: &Theme| header_cell_style(theme, indexed)),
                     );
                 }
                 list = list.push(
@@ -1464,12 +1509,19 @@ impl Viewer {
                                 .padding([3, 10]),
                         );
                     }
+                    let striped = index % 2 == 1;
                     list = list.push(
-                        container(line)
-                            .width(Length::Fixed(table_width))
-                            .height(Length::Fixed(row_height))
-                            .clip(true)
-                            .style(stripe_style(index % 2 == 1)),
+                        button(
+                            container(line)
+                                .width(Length::Fixed(table_width))
+                                .height(Length::Fixed(row_height))
+                                .clip(true),
+                        )
+                        .on_press(Message::RowClicked(index))
+                        .padding(0)
+                        .width(Length::Fixed(table_width))
+                        .height(Length::Fixed(row_height))
+                        .style(move |theme, status| table_row_style(theme, status, striped)),
                     );
                     continue;
                 }
@@ -1529,7 +1581,7 @@ impl Viewer {
             scrollable::Direction::Vertical(scrollable::Scrollbar::default())
         };
 
-        column![
+        let content: Element<'_, Message> = column![
             toolbar,
             status_bar,
             controls_card,
@@ -1549,7 +1601,14 @@ impl Viewer {
         ]
         .spacing(8)
         .padding(10)
-        .into()
+        .into();
+
+        // The row detail form floats above the table; `opaque` keeps clicks on
+        // the backdrop from reaching the rows underneath.
+        match &self.detail {
+            Some((row, fields)) => stack([content, opaque(detail_form(*row, fields, &theme))]).into(),
+            None => content,
+        }
     }
 }
 
@@ -1715,32 +1774,113 @@ fn pick_list_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style
     style
 }
 
-/// Table header cell: quiet on rest, accent-tinted on hover so the click-to-index
-/// affordance is discoverable. Indexed columns keep the success accent.
-fn table_header_style(indexed: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let palette = theme.extended_palette();
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let background = if indexed {
-            if hovered {
-                palette.success.base.color
-            } else {
-                palette.success.weak.color
-            }
-        } else if hovered {
-            palette.primary.weak.color
+/// Table header cell background: indexed columns keep the success accent.
+fn header_cell_style(theme: &Theme, indexed: bool) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(if indexed {
+            palette.success.weak.color
         } else {
             palette.background.weak.color
-        };
-        button::Style {
-            background: Some(Background::Color(background)),
-            text_color: if indexed && hovered {
-                palette.success.base.text
-            } else {
-                palette.background.base.text
-            },
-            ..button::Style::default()
+        })),
+        ..container::Style::default()
+    }
+}
+
+/// Data row: zebra striping, tinted with the accent on hover since the whole
+/// row opens the attribute form.
+fn table_row_style(
+    theme: &Theme,
+    status: button::Status,
+    striped: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Background::Color(palette.primary.weak.color))
         }
+        _ if striped => Some(Background::Color(palette.background.weak.color)),
+        _ => None,
+    };
+    button::Style {
+        background,
+        text_color: palette.background.base.text,
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
+}
+
+/// Modal form with every attribute of one matching row. The panel is sized from
+/// the field count so a short record does not leave a mostly empty box.
+fn detail_form<'a>(
+    row: usize,
+    fields: &'a [(String, String)],
+    theme: &Theme,
+) -> Element<'a, Message> {
+    let mut form = column![].spacing(6);
+    for (name, value) in fields {
+        form = form.push(
+            row![
+                container(text(name.as_str()).size(13).color(muted_text(theme)))
+                    .width(Length::Fixed(170.0)),
+                container(text(value.as_str()).size(13).wrapping(Wrapping::Word))
+                    .width(Fill)
+                    .padding([4, 8])
+                    .style(input_like_style),
+            ]
+            .spacing(10)
+            .align_y(Center),
+        );
+    }
+
+    // Keep the body height in step with the fixed-height field rows above.
+    let body_height = (fields.len() as f32 * 33.0).clamp(60.0, 460.0);
+    let panel = container(
+        column![
+            row![
+                text(format!("Match {}", row + 1)).size(16),
+                Space::with_width(Fill),
+                button(text("Close").size(13))
+                    .on_press(Message::CloseDetail)
+                    .padding([6, 12])
+                    .style(secondary_button),
+            ]
+            .align_y(Center),
+            scrollable(form).height(Length::Fixed(body_height)),
+        ]
+        .spacing(12),
+    )
+    .padding(16)
+    .width(Length::Fixed(560.0))
+    .style(card_style);
+
+    container(panel)
+        .center_x(Fill)
+        .center_y(Fill)
+        .width(Fill)
+        .height(Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Read-only field box used by the row detail form.
+fn input_like_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(if palette.is_dark {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+        } else {
+            Color::from_rgb(0.973, 0.976, 0.988)
+        })),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
     }
 }
 
