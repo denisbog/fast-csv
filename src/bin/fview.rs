@@ -38,9 +38,14 @@
 //! exists and the **index** checkbox is on, a non-empty filter becomes a
 //! case-insensitive `beginsWith` prefix query over the indexed columns — served
 //! straight from the index, with exact totals and no file scan. Unchecking
-//! **index** (or using `--case-sensitive`) falls back to the regex. Clicking a
-//! table row opens a form with every attribute of that row, and clicking a chip
-//! copies its value to the clipboard.
+//! **index** (or using `--case-sensitive`) falls back to the regex. Chips show
+//! only the cell value by default; the **attribute names** checkbox brings back
+//! the `attribute = value` label. Clicking a chip copies its value (a tooltip
+//! reveals values clipped by the two-line limit, and a double click opens the
+//! row form), and clicking a table row — or the empty part of a chip row —
+//! opens the form directly. The form closes
+//! with its button, the Escape key, or a click on the backdrop. Escape also
+//! clears the regex or attribute filter the user was last editing.
 //!
 //! Profiles: the set of currently visible attributes can be saved under a name
 //! and re-applied later. Profiles are persisted as TOML in the platform config
@@ -54,11 +59,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use iced::keyboard::{self, Key};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, opaque, pick_list, row, scrollable, stack,
-    text, text_input, Row, Space,
+    button, checkbox, column, container, horizontal_rule, mouse_area, opaque, pick_list, row,
+    scrollable, stack, text, text_input, tooltip, Row, Space,
 };
 use iced::theme::Palette;
 use iced::{
@@ -342,6 +348,13 @@ fn stripe_height(lines: usize) -> f32 {
         + 2.0 * STRIPE_PADDING
 }
 
+/// Filter box the user last typed in, so Escape clears the expected one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterFocus {
+    Results,
+    Attributes,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     OpenFile,
@@ -362,8 +375,15 @@ enum Message {
     ToggleIndex(usize),
     /// Open the detail form for a matching row (index into `rows`).
     RowClicked(usize),
+    /// A chip was clicked (row, column): copies its value and opens the detail
+    /// form when the click is part of a double click.
+    ChipClicked(usize, usize),
+    /// Show the attribute name in chip labels instead of the value alone.
+    ToggleAttributeNames(bool),
     /// Close the row detail form.
     CloseDetail,
+    /// Escape: close the row form, or clear the filter box being edited.
+    Escape,
     /// Copy an attribute value from the detail form: `(attribute, value)`.
     CopyValue(String, String),
     /// Hide an attribute (column index) from the rows.
@@ -417,6 +437,13 @@ struct Viewer {
     /// Attribute whose value was last copied from the detail form, so the form
     /// can confirm the copy.
     copy_notice: Option<String>,
+    /// Render `attribute = value` chip labels; off by default so a chip shows
+    /// just the value.
+    show_attr_names: bool,
+    /// Filter box the user last typed in, so Escape clears that one first.
+    filter_focus: Option<FilterFocus>,
+    /// Last chip click `(when, row, column)`, used to detect a double click.
+    last_chip_click: Option<(Instant, usize, usize)>,
     truncated: bool,
     /// Best known total number of matching rows from the last scan.
     matched: usize,
@@ -490,6 +517,9 @@ impl Viewer {
             rows: Vec::new(),
             detail: None,
             copy_notice: None,
+            show_attr_names: false,
+            filter_focus: None,
+            last_chip_click: None,
             truncated: false,
             matched: 0,
             rows_read: 0,
@@ -555,6 +585,8 @@ impl Viewer {
         self.rows.clear();
         self.detail = None;
         self.copy_notice = None;
+        self.last_chip_click = None;
+        self.filter_focus = None;
         self.truncated = false;
         self.matched = 0;
         self.rows_read = 0;
@@ -734,6 +766,7 @@ impl Viewer {
                 // Do not scan on every keystroke: record the edit and let the
                 // debounce timer start a single scan once typing pauses.
                 self.filter = value;
+                self.filter_focus = Some(FilterFocus::Results);
                 self.last_edit = Some(Instant::now());
                 self.debounce_pending = true;
                 Task::none()
@@ -799,22 +832,70 @@ impl Viewer {
                 }
             }
             Message::RowClicked(index) => {
-                // Snapshot the values so the form keeps showing this row even
-                // when a later scan replaces the visible matches.
-                let fields = self.rows.get(index).map(|values| {
-                    (0..values.len())
-                        .map(|column| (self.header(column).to_string(), values[column].clone()))
-                        .collect()
-                });
-                if let Some(fields) = fields {
-                    self.detail = Some((index, fields));
-                    self.copy_notice = None;
+                self.open_detail(index);
+                Task::none()
+            }
+            Message::ChipClicked(row, column) => {
+                let Some(value) = self.rows.get(row).and_then(|values| values.get(column)).cloned()
+                else {
+                    return Task::none();
+                };
+                // A second click on the same chip within the double-click window
+                // also opens the row form, so a clipped value can be read in
+                // full (the tooltip covers the quick look case).
+                let now = Instant::now();
+                let double = self
+                    .last_chip_click
+                    .map(|(when, row0, column0)| {
+                        row0 == row
+                            && column0 == column
+                            && now.duration_since(when) < Duration::from_millis(400)
+                    })
+                    .unwrap_or(false);
+                self.last_chip_click = if double {
+                    None
+                } else {
+                    Some((now, row, column))
+                };
+                if double {
+                    self.open_detail(row);
                 }
+                self.copy_notice = Some(self.header(column).to_string());
+                iced::clipboard::write(value)
+            }
+            Message::ToggleAttributeNames(checked) => {
+                self.show_attr_names = checked;
                 Task::none()
             }
             Message::CloseDetail => {
                 self.detail = None;
                 self.copy_notice = None;
+                Task::none()
+            }
+            Message::Escape => {
+                // Escape closes the row form first. Otherwise it clears the
+                // filter box the user was last editing, falling back to the
+                // other one when that box is already empty; clearing the regex
+                // re-runs the scan.
+                if self.detail.is_some() {
+                    self.detail = None;
+                    self.copy_notice = None;
+                    return Task::none();
+                }
+                let attributes_first = self.filter_focus == Some(FilterFocus::Attributes);
+                if attributes_first && !self.attribute_filter.is_empty() {
+                    self.attribute_filter.clear();
+                } else if !attributes_first && !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.debounce_pending = false;
+                    return self.start_scan();
+                } else if !self.attribute_filter.is_empty() {
+                    self.attribute_filter.clear();
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.debounce_pending = false;
+                    return self.start_scan();
+                }
                 Task::none()
             }
             Message::CopyValue(attribute, value) => {
@@ -847,6 +928,7 @@ impl Viewer {
             }
             Message::AttributeFilterChanged(value) => {
                 self.attribute_filter = value;
+                self.filter_focus = Some(FilterFocus::Attributes);
                 Task::none()
             }
             Message::ProfileSelected(name) => {
@@ -886,14 +968,9 @@ impl Viewer {
                 // Keep the virtual viewport fresh so a taller window renders more
                 // rows without waiting for the next scroll event.
                 self.viewport_height = height.max(1.0);
-                // Only rebuild the chip layout when the number of chips per line
-                // actually changes; resize events fire continuously while a
-                // window edge is dragged.
-                let (old_columns, _, old_hidden) = chip_layout(self.window_width);
-                let (new_columns, _, new_hidden) = chip_layout(width);
-                if old_columns != new_columns || old_hidden != new_hidden {
-                    self.window_width = width;
-                }
+                // The chip layout and the row form size themselves from the
+                // window width, so always record the latest value.
+                self.window_width = width;
                 Task::none()
             }
             Message::Scrolled(viewport) => {
@@ -988,6 +1065,20 @@ impl Viewer {
         }
     }
 
+    /// Snapshot one matching row into the detail form, so the form keeps
+    /// showing it even when a later scan replaces the visible matches.
+    fn open_detail(&mut self, row: usize) {
+        let fields = self.rows.get(row).map(|values| {
+            (0..values.len())
+                .map(|column| (self.header(column).to_string(), values[column].clone()))
+                .collect()
+        });
+        if let Some(fields) = fields {
+            self.detail = Some((row, fields));
+            self.copy_notice = None;
+        }
+    }
+
     /// App theme, handed to iced once at startup; every custom style above
     /// reads its colors from the palette it defines.
     fn theme(&self) -> Theme {
@@ -1005,7 +1096,25 @@ impl Viewer {
         } else {
             Subscription::none()
         };
-        Subscription::batch([resize, debounce])
+        // Escape closes the row form or clears the filter box being edited.
+        // `listen_with` rather than `on_key_press`: a focused text input
+        // captures Escape before a subscription that only sees ignored events
+        // would receive it.
+        let escape = if self.detail.is_some()
+            || !self.filter.is_empty()
+            || !self.attribute_filter.is_empty()
+        {
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::event::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::Escape),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([resize, debounce, escape])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1187,6 +1296,10 @@ impl Viewer {
                 .on_toggle_maybe((!self.indexes.is_empty()).then_some(Message::ToggleUseIndex))
                 .text_size(12)
                 .style(checkbox_style),
+            checkbox("attribute names", self.show_attr_names)
+                .on_toggle(Message::ToggleAttributeNames)
+                .text_size(12)
+                .style(checkbox_style),
         ]
         .spacing(12)
         .align_y(Center);
@@ -1242,7 +1355,7 @@ impl Viewer {
         let (columns, chip_max, hidden_columns) = chip_layout(self.window_width);
 
         let mut hidden_bar = column![].spacing(6).padding(0);
-        let mut controls = Row::new().spacing(6).align_y(Center);
+        let mut controls = Row::new().spacing(10).align_y(Center).width(Fill);
         controls = controls.push(
             button(
                 row![
@@ -1288,7 +1401,8 @@ impl Viewer {
         }
         // Attribute filter: highlights matching chips in the main view and
         // narrows the hidden attribute list below to the matching names.
-        controls = controls.push(text("Attributes:").size(13).color(muted_text(&theme)));
+        controls = controls.push(separator());
+        controls = controls.push(text("Attributes").size(13).color(muted_text(&theme)));
         controls = controls.push(
             text_input("filter attributes…", &self.attribute_filter)
                 .on_input(Message::AttributeFilterChanged)
@@ -1298,10 +1412,12 @@ impl Viewer {
                 .width(Length::Fixed(200.0)),
         );
 
-        // Profile controls: pick a saved profile, overwrite it, or save the
-        // current visible set under a new name.
+        // Profile controls sit on the right of the bar: pick a saved profile,
+        // overwrite it, or save the current visible set under a new name.
         let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
-        controls = controls.push(text("Profile:").size(13).color(muted_text(&theme)));
+        controls = controls.push(Space::with_width(Fill));
+        controls = controls.push(separator());
+        controls = controls.push(text("Profile").size(13).color(muted_text(&theme)));
         controls = controls.push(
             pick_list(
                 profile_names,
@@ -1466,7 +1582,14 @@ impl Viewer {
             .collect();
         let table_width: f32 = column_widths.iter().sum::<f32>().max(1.0);
 
-        let mut list = column![].spacing(0).padding(0);
+        // Right padding keeps the chips (and the table) clear of the scrollbar,
+        // which iced draws over the right edge of the scrollable.
+        let mut list = column![]
+            .spacing(0)
+            .padding(Padding {
+                right: 14.0,
+                ..Padding::ZERO
+            });
         if self.rows.is_empty() {
             let message = if self.scanning {
                 "scanning…"
@@ -1581,7 +1704,7 @@ impl Viewer {
                         .padding(0)
                         .width(Length::Fixed(table_width))
                         .height(Length::Fixed(row_height))
-                        .style(move |theme, status| table_row_style(theme, status, striped)),
+                        .style(move |theme, status| row_button_style(theme, status, striped, true)),
                     );
                     continue;
                 }
@@ -1598,10 +1721,12 @@ impl Viewer {
                         line = line.push(chip(
                             header,
                             &values[column],
+                            index,
                             column,
                             chip_max,
                             highlight,
                             indexed,
+                            self.show_attr_names,
                         ));
                     }
                     // Clip each chip line to a fixed height so a very long value
@@ -1612,13 +1737,23 @@ impl Viewer {
                             .clip(true),
                     );
                 }
+                // The stripe is a button too: clicking the row (but not a chip,
+                // which captures its own click) opens the same attribute form as
+                // a table row.
+                let striped = index % 2 == 1;
                 list = list.push(
-                    container(block)
-                        .width(Fill)
-                        .height(Length::Fixed(row_height))
-                        .clip(true)
-                        .padding([STRIPE_PADDING, 12.0])
-                        .style(stripe_style(index % 2 == 1)),
+                    button(
+                        container(block)
+                            .width(Fill)
+                            .height(Length::Fixed(row_height))
+                            .clip(true)
+                            .padding([STRIPE_PADDING, 12.0]),
+                    )
+                    .on_press(Message::RowClicked(index))
+                    .padding(0)
+                    .width(Fill)
+                    .height(Length::Fixed(row_height))
+                    .style(move |theme, status| row_button_style(theme, status, striped, false)),
                 );
             }
 
@@ -1668,12 +1803,13 @@ impl Viewer {
         match &self.detail {
             Some((row, fields)) => stack([
                 content,
-                opaque(detail_form(
+                detail_form(
                     *row,
                     fields,
                     self.copy_notice.as_deref(),
+                    self.window_width,
                     &theme,
-                )),
+                ),
             ])
             .into(),
             None => content,
@@ -1838,9 +1974,30 @@ fn checkbox_style(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
 
 /// Rounded drop-down matching the text inputs.
 fn pick_list_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let palette = theme.extended_palette();
+    let text = palette.background.base.text;
     let mut style = pick_list::default(theme, status);
     style.border.radius = RADIUS.into();
+    // The built-in placeholder/handle colors are too faint on the card surface.
+    style.text_color = text;
+    style.placeholder_color = Color { a: 0.75, ..text };
+    style.handle_color = Color { a: 0.7, ..text };
     style
+}
+
+/// Thin vertical rule used to group the controls bar into clusters.
+fn separator() -> Element<'static, Message> {
+    container(Space::new(
+        Length::Fixed(1.0),
+        Length::Fixed(18.0),
+    ))
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.strong.color,
+        )),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// Table header cell background: indexed columns keep the success accent.
@@ -1856,20 +2013,25 @@ fn header_cell_style(theme: &Theme, indexed: bool) -> container::Style {
     }
 }
 
-/// Data row: zebra striping, tinted with the accent on hover since the whole
-/// row opens the attribute form.
-fn table_row_style(
+/// Row background for the table rows and the chip stripes: zebra striping, and
+/// (for the table) an accent tint on hover since the whole row opens the form.
+/// The chip stripes pass `hover_highlight = false`: the row is still clickable,
+/// but hovering it must not flash a highlight behind the chips.
+fn row_button_style(
     theme: &Theme,
     status: button::Status,
     striped: bool,
+    hover_highlight: bool,
 ) -> button::Style {
     let palette = theme.extended_palette();
-    let background = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            Some(Background::Color(palette.primary.weak.color))
-        }
-        _ if striped => Some(Background::Color(palette.background.weak.color)),
-        _ => None,
+    let hovered = hover_highlight
+        && matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if hovered {
+        Some(Background::Color(palette.primary.weak.color))
+    } else if striped {
+        Some(Background::Color(palette.background.weak.color))
+    } else {
+        None
     };
     button::Style {
         background,
@@ -1888,9 +2050,14 @@ fn detail_form<'a>(
     row: usize,
     fields: &'a [(String, String)],
     copy_notice: Option<&str>,
+    window_width: f32,
     theme: &Theme,
 ) -> Element<'a, Message> {
     let palette = theme.extended_palette();
+    // Follow the window instead of a fixed width, so the form stays usable in a
+    // narrow window and does not sprawl in a wide one.
+    let panel_width = (window_width * 0.55).clamp(360.0, 820.0);
+    let label_width = (panel_width * 0.28).clamp(90.0, 170.0);
     let mut form = column![]
         .spacing(6)
         // Clear of the scrollbar, which is drawn over the right edge of the
@@ -1903,7 +2070,7 @@ fn detail_form<'a>(
         form = form.push(
             row![
                 container(text(name.as_str()).size(13).color(muted_text(theme)))
-                    .width(Length::Fixed(160.0))
+                    .width(Length::Fixed(label_width))
                     .align_x(iced::Alignment::End),
                 container(text(value.as_str()).size(13).wrapping(Wrapping::Word))
                     .width(Fill)
@@ -1994,10 +2161,10 @@ fn detail_form<'a>(
         .spacing(12),
     )
     .padding(16)
-    .width(Length::Fixed(580.0))
+    .width(Length::Fixed(panel_width))
     .style(card_style);
 
-    container(panel)
+    let overlay = container(opaque(panel))
         .center_x(Fill)
         .center_y(Fill)
         .width(Fill)
@@ -2005,8 +2172,11 @@ fn detail_form<'a>(
         .style(|_theme: &Theme| container::Style {
             background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    // Clicking the dimmed backdrop closes the form; `opaque(panel)` keeps
+    // presses inside the panel from reaching the backdrop.
+    mouse_area(overlay).on_press(Message::CloseDetail).into()
 }
 
 /// Read-only field box used by the row detail form.
@@ -2122,21 +2292,28 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
     }
 }
 
-/// A single `attribute = value` chip with an index toggle and a mute icon.
-/// `highlight` marks chips whose attribute name matches the attribute filter;
-/// `indexed` marks attributes with a built prefix index and switches the icon
-/// from an outline to a filled database.
+/// A single chip with an index toggle and a mute icon. `show_name` renders
+/// `attribute = value` instead of the value alone; the tooltip always shows the
+/// full label, and a click copies the value (a double click opens the row form).
 fn chip<'a>(
     header: &'a str,
     value: &'a str,
-    index: usize,
+    row: usize,
+    column: usize,
     max_width: f32,
     highlight: bool,
     indexed: bool,
+    show_name: bool,
 ) -> Element<'a, Message> {
-    let label_text = format!("{header} = {value}");
+    let full_label = format!("{header} = {value}");
+    let label_text = if show_name {
+        full_label.clone()
+    } else {
+        value.to_string()
+    };
     let content_width = (max_width - CHIP_CHROME).max(60.0);
-    let label = if estimate_chip_width(&label_text) > max_width {
+    let clipped = estimate_chip_width(&label_text) > max_width;
+    let label = if clipped {
         text(label_text)
             .size(13)
             .width(Length::Fixed(content_width))
@@ -2151,25 +2328,41 @@ fn chip<'a>(
         Bootstrap::Database
     };
     let toggle_index = button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
-        .on_press(Message::ToggleIndex(index))
+        .on_press(Message::ToggleIndex(column))
         .padding(2)
         .style(ghost_button);
 
     let mute = button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
-        .on_press(Message::Mute(index))
+        .on_press(Message::Mute(column))
         .padding(2)
         .style(ghost_button);
 
     // Clicking the chip (anywhere but the two icons, which capture their own
     // events) copies the cell value to the clipboard.
-    button(
+    let chip = button(
         container(row![label, toggle_index, mute].spacing(6).align_y(Center))
             .padding([3, 8])
             .style(move |theme| chip_style(theme, highlight, indexed)),
     )
-    .on_press(Message::CopyValue(header.to_string(), value.to_string()))
+    .on_press(Message::ChipClicked(row, column))
     .padding(0)
-    .style(chip_button_style)
+    .style(chip_button_style);
+
+    if !clipped {
+        return chip.into();
+    }
+
+    // Only clipped chips need the overlay; the tooltip reveals the full value
+    // that the two-line limit cuts off.
+    tooltip(
+        chip,
+        container(text(full_label).size(12).wrapping(Wrapping::Word))
+            .width(Length::Fixed(360.0))
+            .padding(8),
+        tooltip::Position::FollowCursor,
+    )
+    .gap(4)
+    .padding(0)
     .into()
 }
 
