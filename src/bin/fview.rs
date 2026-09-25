@@ -39,7 +39,8 @@
 //! case-insensitive `beginsWith` prefix query over the indexed columns — served
 //! straight from the index, with exact totals and no file scan. Unchecking
 //! **index** (or using `--case-sensitive`) falls back to the regex. Clicking a
-//! table row opens a form with every attribute of that row.
+//! table row opens a form with every attribute of that row, and clicking a chip
+//! copies its value to the clipboard.
 //!
 //! Profiles: the set of currently visible attributes can be saved under a name
 //! and re-applied later. Profiles are persisted as TOML in the platform config
@@ -1213,8 +1214,26 @@ impl Viewer {
         // The status gets its own line so a long message cannot squeeze the
         // filter field in the bar above. It keeps a fixed height because the
         // scanning/error states are taller than plain status text and would
-        // otherwise shift the table down by a few pixels.
-        let status_bar = container(status)
+        // otherwise shift the table down by a few pixels. A chip or form copy
+        // is confirmed on the right of the same line.
+        let mut status_line = Row::new().spacing(8).align_y(Center).push(status);
+        status_line = status_line.push(Space::with_width(Fill));
+        if let Some(attribute) = &self.copy_notice {
+            status_line = status_line.push(
+                row![
+                    text(char::from(Bootstrap::CheckLg))
+                        .font(BOOTSTRAP_FONT)
+                        .size(12)
+                        .color(palette.success.strong.color),
+                    text(format!("copied {attribute}"))
+                        .size(12)
+                        .color(palette.success.strong.color),
+                ]
+                .spacing(4)
+                .align_y(Center),
+            );
+        }
+        let status_bar = container(status_line)
             .height(Length::Fixed(STATUS_HEIGHT))
             .align_y(Center)
             .padding([0.0, 4.0]);
@@ -2141,10 +2160,34 @@ fn chip<'a>(
         .padding(2)
         .style(ghost_button);
 
-    container(row![label, toggle_index, mute].spacing(6).align_y(Center))
-        .padding([3, 8])
-        .style(move |theme| chip_style(theme, highlight, indexed))
-        .into()
+    // Clicking the chip (anywhere but the two icons, which capture their own
+    // events) copies the cell value to the clipboard.
+    button(
+        container(row![label, toggle_index, mute].spacing(6).align_y(Center))
+            .padding([3, 8])
+            .style(move |theme| chip_style(theme, highlight, indexed)),
+    )
+    .on_press(Message::CopyValue(header.to_string(), value.to_string()))
+    .padding(0)
+    .style(chip_button_style)
+    .into()
+}
+
+/// Chip wrapper button: invisible apart from a faint accent tint on hover, so
+/// the chip keeps its own border and background.
+fn chip_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(Background::Color(palette.primary.weak.color))
+            }
+            _ => None,
+        },
+        text_color: palette.background.base.text,
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
 }
 
 /// Rough estimate of a chip's width, used to decide whether its label must
