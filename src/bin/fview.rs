@@ -61,8 +61,8 @@ use iced::widget::{
 };
 use iced::theme::Palette;
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Shadow, Subscription, Task, Theme,
-    Vector,
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Shadow, Subscription, Task,
+    Theme, Vector,
 };
 use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
 use memmap2::Mmap;
@@ -269,15 +269,16 @@ fn hidden_note(count: usize) -> String {
 
 /// Status line for the current scan. `rows_read` is the number of data rows
 /// read; when the scan was not truncated it is the total number of rows in the
-/// file.
+/// file. `elapsed` appends how long the search itself took.
 fn status_text(
     shown: usize,
     matched: usize,
     rows_read: usize,
     truncated: bool,
     indexed: bool,
+    elapsed: Option<Duration>,
 ) -> String {
-    if indexed {
+    let summary = if indexed {
         if truncated {
             format!("showing first {shown} of {matched} matching rows (index prefix)")
         } else {
@@ -293,6 +294,22 @@ fn status_text(
         format!("{rows_read} rows")
     } else {
         format!("{matched} matching rows of {rows_read} total")
+    };
+
+    match elapsed {
+        Some(elapsed) => format!("{summary} · {}", format_duration(elapsed)),
+        None => summary,
+    }
+}
+
+/// Compact duration for the status line: milliseconds below one second, seconds
+/// with two decimals above.
+fn format_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 1.0 {
+        format!("{} ms", elapsed.as_millis())
+    } else {
+        format!("{seconds:.2} s")
     }
 }
 
@@ -346,6 +363,8 @@ enum Message {
     RowClicked(usize),
     /// Close the row detail form.
     CloseDetail,
+    /// Copy an attribute value from the detail form: `(attribute, value)`.
+    CopyValue(String, String),
     /// Hide an attribute (column index) from the rows.
     Mute(usize),
     /// Show a previously hidden attribute again.
@@ -394,6 +413,9 @@ struct Viewer {
     /// Attribute/value snapshot of the row opened in the detail form, together
     /// with its 0-based position in `rows` (for the title).
     detail: Option<(usize, Vec<(String, String)>)>,
+    /// Attribute whose value was last copied from the detail form, so the form
+    /// can confirm the copy.
+    copy_notice: Option<String>,
     truncated: bool,
     /// Best known total number of matching rows from the last scan.
     matched: usize,
@@ -401,6 +423,10 @@ struct Viewer {
     rows_read: usize,
     error: Option<String>,
     scanning: bool,
+    /// When the in-flight scan started, used to time the search.
+    scan_started: Option<Instant>,
+    /// Duration of the last completed scan, shown in the status line.
+    scan_duration: Option<Duration>,
     dirty: bool,
     /// Filter text used when the last scan was started, so a redundant rescan
     /// of an unchanged pattern is skipped.
@@ -462,11 +488,14 @@ impl Viewer {
             filter: String::new(),
             rows: Vec::new(),
             detail: None,
+            copy_notice: None,
             truncated: false,
             matched: 0,
             rows_read: 0,
             error: None,
             scanning: false,
+            scan_started: None,
+            scan_duration: None,
             dirty: false,
             last_scanned: None,
             debounce_pending: false,
@@ -519,9 +548,12 @@ impl Viewer {
     fn load_file(&mut self, path: PathBuf) -> Task<Message> {
         self.generation += 1;
         self.scanning = false;
+        self.scan_started = None;
+        self.scan_duration = None;
         self.dirty = false;
         self.rows.clear();
         self.detail = None;
+        self.copy_notice = None;
         self.truncated = false;
         self.matched = 0;
         self.rows_read = 0;
@@ -637,6 +669,7 @@ impl Viewer {
 
         self.error = None;
         self.scanning = true;
+        self.scan_started = Some(Instant::now());
         self.dirty = false;
         self.generation += 1;
         let generation = self.generation;
@@ -774,12 +807,18 @@ impl Viewer {
                 });
                 if let Some(fields) = fields {
                     self.detail = Some((index, fields));
+                    self.copy_notice = None;
                 }
                 Task::none()
             }
             Message::CloseDetail => {
                 self.detail = None;
+                self.copy_notice = None;
                 Task::none()
+            }
+            Message::CopyValue(attribute, value) => {
+                self.copy_notice = Some(attribute);
+                iced::clipboard::write(value)
             }
             Message::Mute(index) => {
                 self.muted.insert(index);
@@ -877,6 +916,7 @@ impl Viewer {
                     Err(message) => self.error = Some(message),
                 }
                 self.scanning = false;
+                self.scan_duration = self.scan_started.take().map(|start| start.elapsed());
                 self.scroll_offset = 0.0;
                 // Jump the row list back to the top for the new result set.
                 let reset = scrollable::scroll_to(
@@ -1119,6 +1159,7 @@ impl Viewer {
                 self.rows_read,
                 self.truncated,
                 self.indexed_result,
+                self.scan_duration,
             ))
             .size(13)
             .color(muted_text(&theme))
@@ -1606,7 +1647,16 @@ impl Viewer {
         // The row detail form floats above the table; `opaque` keeps clicks on
         // the backdrop from reaching the rows underneath.
         match &self.detail {
-            Some((row, fields)) => stack([content, opaque(detail_form(*row, fields, &theme))]).into(),
+            Some((row, fields)) => stack([
+                content,
+                opaque(detail_form(
+                    *row,
+                    fields,
+                    self.copy_notice.as_deref(),
+                    &theme,
+                )),
+            ])
+            .into(),
             None => content,
         }
     }
@@ -1810,48 +1860,122 @@ fn table_row_style(
     }
 }
 
+/// Row height of one field in the detail form; also used to size the body.
+const FORM_ROW_HEIGHT: f32 = 36.0;
+
 /// Modal form with every attribute of one matching row. The panel is sized from
 /// the field count so a short record does not leave a mostly empty box.
 fn detail_form<'a>(
     row: usize,
     fields: &'a [(String, String)],
+    copy_notice: Option<&str>,
     theme: &Theme,
 ) -> Element<'a, Message> {
-    let mut form = column![].spacing(6);
+    let palette = theme.extended_palette();
+    let mut form = column![]
+        .spacing(6)
+        // Clear of the scrollbar, which is drawn over the right edge of the
+        // scrollable and would otherwise cover the copy buttons.
+        .padding(Padding {
+            right: 14.0,
+            ..Padding::ZERO
+        });
     for (name, value) in fields {
         form = form.push(
             row![
                 container(text(name.as_str()).size(13).color(muted_text(theme)))
-                    .width(Length::Fixed(170.0)),
+                    .width(Length::Fixed(160.0))
+                    .align_x(iced::Alignment::End),
                 container(text(value.as_str()).size(13).wrapping(Wrapping::Word))
                     .width(Fill)
-                    .padding([4, 8])
+                    .padding([5, 10])
                     .style(input_like_style),
+                button(
+                    text(char::from(Bootstrap::Clipboard))
+                        .font(BOOTSTRAP_FONT)
+                        .size(13),
+                )
+                .on_press(Message::CopyValue(name.clone(), value.clone()))
+                .padding(4)
+                .style(ghost_button),
             ]
-            .spacing(10)
+            .spacing(8)
             .align_y(Center),
         );
     }
 
+    // Header: a tinted glyph, the match number and a short attribute count.
+    let heading = row![
+        container(
+            text(char::from(Bootstrap::CardList))
+                .font(BOOTSTRAP_FONT)
+                .size(16)
+                .color(palette.primary.base.color),
+        )
+        .padding([8, 9])
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(
+                theme.extended_palette().primary.weak.color,
+            )),
+            border: Border {
+                radius: 8.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        }),
+        column![
+            text(format!("Match {}", row + 1)).size(17),
+            text(if fields.len() == 1 {
+                "1 attribute".to_string()
+            } else {
+                format!("{} attributes", fields.len())
+            })
+            .size(12)
+            .color(muted_text(theme)),
+        ]
+        .spacing(2),
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    let mut header = Row::new().spacing(10).align_y(Center).push(heading);
+    header = header.push(Space::with_width(Fill));
+    if let Some(attribute) = copy_notice {
+        header = header.push(
+            row![
+                text(char::from(Bootstrap::CheckLg))
+                    .font(BOOTSTRAP_FONT)
+                    .size(12)
+                    .color(palette.success.strong.color),
+                text(format!("copied {attribute}"))
+                    .size(12)
+                    .color(palette.success.strong.color),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        );
+    }
+    header = header.push(
+        button(text("Close").size(13))
+            .on_press(Message::CloseDetail)
+            .padding([6, 12])
+            .style(secondary_button),
+    );
+
     // Keep the body height in step with the fixed-height field rows above.
-    let body_height = (fields.len() as f32 * 33.0).clamp(60.0, 460.0);
+    let body_height = (fields.len() as f32 * FORM_ROW_HEIGHT).clamp(60.0, 440.0);
     let panel = container(
         column![
-            row![
-                text(format!("Match {}", row + 1)).size(16),
-                Space::with_width(Fill),
-                button(text("Close").size(13))
-                    .on_press(Message::CloseDetail)
-                    .padding([6, 12])
-                    .style(secondary_button),
-            ]
-            .align_y(Center),
-            scrollable(form).height(Length::Fixed(body_height)),
+            header,
+            horizontal_rule(1).style(divider_style),
+            scrollable(form)
+                .height(Length::Fixed(body_height))
+                .style(scrollbar_style),
         ]
         .spacing(12),
     )
     .padding(16)
-    .width(Length::Fixed(560.0))
+    .width(Length::Fixed(580.0))
     .style(card_style);
 
     container(panel)
@@ -2476,25 +2600,37 @@ mod tests {
     #[test]
     fn status_text_reports_rows_read() {
         assert_eq!(
-            status_text(100, 100, 101, true, false),
+            status_text(100, 100, 101, true, false, None),
             "showing first 100 matching rows (more available) · 101 rows read"
         );
         // A full scan knows the exact match total, so it can name it.
         assert_eq!(
-            status_text(100, 714, 5000, true, false),
+            status_text(100, 714, 5000, true, false, None),
             "showing first 100 of 714 matching rows · 5000 rows read"
         );
         assert_eq!(
-            status_text(7, 7, 500, false, false),
+            status_text(7, 7, 500, false, false, None),
             "7 matching rows of 500 total"
         );
-        assert_eq!(status_text(500, 500, 500, false, false), "500 rows");
+        assert_eq!(status_text(500, 500, 500, false, false, None), "500 rows");
         // Index results are exact and never read the file.
         assert_eq!(
-            status_text(100, 714, 714, true, true),
+            status_text(100, 714, 714, true, true, None),
             "showing first 100 of 714 matching rows (index prefix)"
         );
-        assert_eq!(status_text(7, 7, 7, false, true), "7 matching rows (index prefix)");
+        assert_eq!(
+            status_text(7, 7, 7, false, true, None),
+            "7 matching rows (index prefix)"
+        );
+        // A completed search appends how long it took.
+        assert_eq!(
+            status_text(7, 7, 7, false, true, Some(Duration::from_millis(42))),
+            "7 matching rows (index prefix) · 42 ms"
+        );
+        assert_eq!(
+            status_text(500, 500, 500, false, false, Some(Duration::from_millis(1500))),
+            "500 rows · 1.50 s"
+        );
     }
 
     #[test]
