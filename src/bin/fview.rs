@@ -106,8 +106,9 @@ const STRIPE_PADDING: f32 = 8.0;
 const CHIP_LINE_SPACING: f32 = 6.0;
 /// Rows rendered above and below the viewport so scrolling does not flash gaps.
 const OVERSCAN_ROWS: usize = 3;
-/// Preferred chip width used to decide how many chips fit on a line.
-const TARGET_CHIP_WIDTH: f32 = 280.0;
+/// Preferred chip width used to decide how many chips fit on a line before any
+/// rows are known.
+const DEFAULT_CHIP_WIDTH: f32 = 220.0;
 /// Rough width of one character at size 13, used to decide text wrapping.
 const CHAR_WIDTH: f32 = 7.2;
 /// Corner radius shared by cards, inputs and buttons.
@@ -320,16 +321,60 @@ fn format_duration(elapsed: Duration) -> String {
     }
 }
 
-/// Layout geometry derived from the window width: chips per line, the maximum
-/// chip width, and how many hidden-attribute chips fit on a line.
-fn chip_layout(width: f32) -> (usize, f32, usize) {
+/// Layout geometry derived from the window width and the width of a typical
+/// chip: chips per line, the maximum chip width, and how many hidden-attribute
+/// chips fit on a line.
+fn chip_layout(width: f32, chip_width: f32) -> (usize, f32, usize) {
     let available = (width - 28.0).max(200.0);
-    let columns = ((available / TARGET_CHIP_WIDTH).floor() as usize).max(1);
+    let chip_width = chip_width.max(120.0);
+    let columns = (((available + CHIP_SPACING) / (chip_width + CHIP_SPACING)).floor() as usize)
+        .max(1)
+        .min(available as usize / 60);
     let chip_max = ((available - (columns.saturating_sub(1) as f32) * CHIP_SPACING)
         / columns as f32)
         .max(120.0);
     let hidden_columns = ((available / 170.0).floor() as usize).max(1);
     (columns, chip_max, hidden_columns)
+}
+
+/// Estimated width of the widest chip in the current window, used to decide how
+/// many chips fit on a line. Using the widest label keeps chips from wrapping
+/// earlier than necessary while still filling the row. Only the first rows are
+/// sampled so a large result set does not slow the view down.
+fn typical_chip_width(
+    rows: &[Vec<String>],
+    visible_columns: &[usize],
+    headers: &[String],
+    show_names: bool,
+) -> f32 {
+    const SAMPLE_ROWS: usize = 16;
+    let header_chars = |column: usize| {
+        headers.get(column).map(String::as_str).unwrap_or("").chars().count()
+    };
+    let mut widest: f32 = 0.0;
+    for row in rows.iter().take(SAMPLE_ROWS) {
+        for &column in visible_columns {
+            let value_chars = row.get(column).map(String::as_str).unwrap_or("").chars().count();
+            let chars = if show_names {
+                header_chars(column) + 3 + value_chars
+            } else {
+                value_chars
+            };
+            widest = widest.max(chars as f32 * CHAR_WIDTH + CHIP_CHROME);
+        }
+    }
+    if show_names {
+        // A header alone must not be clipped either.
+        for &column in visible_columns {
+            widest = widest.max(header_chars(column) as f32 * CHAR_WIDTH + CHIP_CHROME);
+        }
+    }
+    // Before any rows are known, fall back to a sensible average chip.
+    if widest > 0.0 {
+        widest
+    } else {
+        DEFAULT_CHIP_WIDTH
+    }
 }
 
 /// Height reserved for one line of chips, tall enough for the maximum number
@@ -1351,8 +1396,22 @@ impl Viewer {
             .align_y(Center)
             .padding([0.0, 4.0]);
 
-        // Hidden attributes live in the top bar; clicking restores them.
-        let (columns, chip_max, hidden_columns) = chip_layout(self.window_width);
+        // Chip geometry: how many chips fit on a line depends on how wide a chip
+        // actually is, which follows the visible values (or the headers when the
+        // attribute names are shown). `columns`/`chip_max` are uniform for the
+        // whole list so every stripe keeps the same height, which is what the
+        // virtual scrolling relies on.
+        let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
+        let visible_columns: Vec<usize> = (0..self.headers.len())
+            .filter(|index| !self.muted.contains(index))
+            .collect();
+        let chip_width = typical_chip_width(
+            &self.rows,
+            &visible_columns,
+            &self.headers,
+            self.show_attr_names,
+        );
+        let (columns, chip_max, hidden_columns) = chip_layout(self.window_width, chip_width);
 
         let mut hidden_bar = column![].spacing(6).padding(0);
         let mut controls = Row::new().spacing(10).align_y(Center).width(Fill);
@@ -1563,11 +1622,6 @@ impl Viewer {
             .width(Fill)
             .padding([10, 12])
             .style(card_style);
-
-        let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
-        let visible_columns: Vec<usize> = (0..self.headers.len())
-            .filter(|index| !self.muted.contains(index))
-            .collect();
 
         // Table geometry: each column keeps at least `TABLE_CELL_MIN_WIDTH`, so
         // the table grows horizontally instead of squeezing columns into the
@@ -3039,12 +3093,16 @@ mod tests {
     #[test]
     fn chip_layout_is_always_usable() {
         for width in [0.0, 100.0, 600.0, 1200.0, 4000.0] {
-            let (columns, chip_max, hidden_columns) = chip_layout(width);
-            assert!(columns >= 1);
-            assert!(hidden_columns >= 1);
-            assert!(chip_max >= 120.0);
+            for chip_width in [0.0, 120.0, 260.0, 800.0] {
+                let (columns, chip_max, hidden_columns) = chip_layout(width, chip_width);
+                assert!(columns >= 1);
+                assert!(hidden_columns >= 1);
+                assert!(chip_max >= 120.0);
+            }
         }
-        // A wider window fits at least as many chips per line.
-        assert!(chip_layout(2400.0).0 >= chip_layout(800.0).0);
+        // A wider window fits at least as many chips per line, and narrower
+        // chips fit at least as many as wider ones.
+        assert!(chip_layout(2400.0, 200.0).0 >= chip_layout(800.0, 200.0).0);
+        assert!(chip_layout(1200.0, 120.0).0 >= chip_layout(1200.0, 400.0).0);
     }
 }
