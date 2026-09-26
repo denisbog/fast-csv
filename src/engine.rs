@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
+use regex::Regex;
 use simd_csv::ByteRecord;
 
 use crate::compare::CompareOp;
@@ -245,6 +246,7 @@ fn compose_side(
     transforms: &[Transform],
     join: &str,
     trim: bool,
+    part: &mut String,
     scratch: &mut String,
     out: &mut String,
 ) -> bool {
@@ -254,6 +256,7 @@ fn compose_side(
             transforms,
             join,
             trim,
+            part,
             scratch,
             out,
         ),
@@ -268,6 +271,7 @@ fn compose_side(
                     transforms,
                     join,
                     trim,
+                    part,
                     scratch,
                     out,
                 ),
@@ -296,12 +300,30 @@ fn predicate_holds(
 // ---------------------------------------------------------------------------
 
 fn fill_tokens(buffer: &str, multi: bool, separator: &Separator, out: &mut Vec<String>) {
-    out.clear();
-    out.extend(
-        mapping::split_tokens(buffer, multi, separator)
-            .into_iter()
-            .map(str::to_string),
-    );
+    mapping::split_tokens_into(buffer, multi, separator, out);
+}
+
+/// Count records in one segment without applying any rule. Used to assign
+/// exact global row numbers when there is no id column, so validation can
+/// still run in parallel.
+fn count_rows_segment(
+    path: &Path,
+    delimiter: u8,
+    from: u64,
+    to: u64,
+    progress: Option<&Arc<Progress>>,
+) -> Result<u64, String> {
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
+    let mut record = ByteRecord::new();
+    let mut count = 0u64;
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => count += 1,
+            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
+        }
+    }
+    Ok(count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,6 +344,7 @@ fn build_counts_segment(
     let mut left_buf = String::new();
     let mut right_buf = String::new();
     let mut component_buf = String::new();
+    let mut component_buf2 = String::new();
     let mut left_tokens: Vec<String> = Vec::new();
     let mut right_tokens: Vec<String> = Vec::new();
 
@@ -358,6 +381,7 @@ fn build_counts_segment(
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
+                &mut component_buf2,
                 &mut left_buf,
             );
             compose_side(
@@ -368,6 +392,7 @@ fn build_counts_segment(
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
+                &mut component_buf2,
                 &mut right_buf,
             );
             fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
@@ -375,11 +400,7 @@ fn build_counts_segment(
 
             let counts = &mut result[position];
             for (left, right) in left_tokens.iter().zip(right_tokens.iter()) {
-                *counts
-                    .entry(left.as_str().into())
-                    .or_default()
-                    .entry(right.as_str().into())
-                    .or_insert(0) += 1;
+                mapping::bump_counts(counts, left, right);
             }
         }
     }
@@ -412,10 +433,10 @@ fn validate_segment(
     let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
 
     let mut expected_buf: Vec<String> = Vec::new();
-    let mut actual_buf: Vec<String> = Vec::new();
     let mut left_buf = String::new();
     let mut right_buf = String::new();
     let mut component_buf = String::new();
+    let mut component_buf2 = String::new();
     let mut left_tokens: Vec<String> = Vec::new();
     let mut right_tokens: Vec<String> = Vec::new();
 
@@ -454,6 +475,7 @@ fn validate_segment(
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
+                &mut component_buf2,
                 &mut left_buf,
             );
             let right_ok = compose_side(
@@ -464,6 +486,7 @@ fn validate_segment(
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
+                &mut component_buf2,
                 &mut right_buf,
             );
             // Optional relation: when both the source and the target are empty
@@ -492,7 +515,8 @@ fn validate_segment(
                 None => format!("row:{}", row_number.unwrap_or(local_row)),
             };
 
-            let expected_repr: Option<String>;
+            let mapping = mappings[rule_index].as_deref();
+            let expected: &[String];
             let matched;
 
             if let Some(pattern) = &rule.pattern {
@@ -501,51 +525,55 @@ fn validate_segment(
                     CompareOp::NotMatches => left_ok && !is_match,
                     _ => left_ok && is_match,
                 };
-                expected_repr = Some(pattern.as_str().to_string());
+                expected = &[];
             } else {
                 fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
                 fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
 
-                expected_buf.clear();
-                if let Some(mapping) = &mappings[rule_index] {
+                if let Some(mapping) = mapping {
+                    let mut count = 0usize;
                     for token in &left_tokens {
                         match mapping.expected(token) {
-                            Some(target) => expected_buf.push(target.to_string()),
+                            Some(target) => {
+                                token_slot(&mut expected_buf, count).push_str(target)
+                            }
                             None => {
                                 accum.unmapped += 1;
                                 // `\u{0}` cannot appear in a real target, so
                                 // this sentinel can never accidentally match.
-                                expected_buf.push(format!("\u{0}{token}"));
+                                let slot = token_slot(&mut expected_buf, count);
+                                slot.push('\u{0}');
+                                slot.push_str(token);
                             }
                         }
+                        count += 1;
 
                         if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
-                            accum.ambiguous_samples.offer(
-                                token,
-                                Example {
-                                    id: id.clone(),
-                                    row: row_number,
-                                    left: token.clone(),
-                                    right: right_buf.clone(),
-                                    expected: mapping.expected(token).map(str::to_string),
-                                },
-                            );
+                            accum.ambiguous_samples.offer_with(token, || Example {
+                                id: id.clone(),
+                                row: row_number,
+                                left: token.clone(),
+                                right: right_buf.clone(),
+                                expected: mapping.expected(token).map(str::to_string),
+                            });
                         }
                     }
+                    expected_buf.truncate(count);
+                    expected_buf.sort_unstable();
+                    expected_buf.dedup();
+                    expected = &expected_buf;
                 } else {
-                    expected_buf.extend(left_tokens.iter().cloned());
+                    // No mapping: the transformed left value *is* the
+                    // expected set, so sort it in place instead of cloning.
+                    left_tokens.sort_unstable();
+                    left_tokens.dedup();
+                    expected = &left_tokens;
                 }
 
-                actual_buf.clear();
-                actual_buf.extend(right_tokens.iter().cloned());
+                right_tokens.sort_unstable();
+                right_tokens.dedup();
 
-                expected_buf.sort_unstable();
-                expected_buf.dedup();
-                actual_buf.sort_unstable();
-                actual_buf.dedup();
-
-                matched = left_ok && right_ok && rule.compare.evaluate(&expected_buf, &actual_buf);
-                expected_repr = mapping_expected(mappings[rule_index].as_deref(), &expected_buf);
+                matched = left_ok && right_ok && rule.compare.evaluate(expected, &right_tokens);
             }
 
             accum.checked += 1;
@@ -556,36 +584,53 @@ fn validate_segment(
             if matched {
                 accum.passed += 1;
                 if !accum.pass_samples.is_disabled() {
-                    accum.pass_samples.offer(
-                        &id,
-                        Example {
-                            id: id.clone(),
-                            row: row_number,
-                            left: left_buf.clone(),
-                            right: right_buf.clone(),
-                            expected: expected_repr.clone(),
-                        },
-                    );
+                    accum.pass_samples.offer_with(&id, || Example {
+                        id: id.clone(),
+                        row: row_number,
+                        left: left_buf.clone(),
+                        right: right_buf.clone(),
+                        expected: sample_expected(rule.pattern.as_ref(), mapping, expected),
+                    });
                 }
             } else {
                 accum.failed += 1;
                 if !accum.fail_samples.is_disabled() {
-                    accum.fail_samples.offer(
-                        &id,
-                        Example {
-                            id: id.clone(),
-                            row: row_number,
-                            left: left_buf.clone(),
-                            right: right_buf.clone(),
-                            expected: expected_repr.clone(),
-                        },
-                    );
+                    accum.fail_samples.offer_with(&id, || Example {
+                        id: id.clone(),
+                        row: row_number,
+                        left: left_buf.clone(),
+                        right: right_buf.clone(),
+                        expected: sample_expected(rule.pattern.as_ref(), mapping, expected),
+                    });
                 }
             }
         }
     }
 
     Ok(accums)
+}
+
+/// Return a cleared `String` at `index`, growing the buffer if needed. Used to
+/// reuse token storage across rows instead of allocating a new `String`.
+#[inline]
+fn token_slot(out: &mut Vec<String>, index: usize) -> &mut String {
+    if index >= out.len() {
+        out.push(String::new());
+    }
+    let slot = &mut out[index];
+    slot.clear();
+    slot
+}
+
+fn sample_expected(
+    pattern: Option<&Regex>,
+    mapping: Option<&Mapping>,
+    expected: &[String],
+) -> Option<String> {
+    match pattern {
+        Some(pattern) => Some(pattern.as_str().to_string()),
+        None => mapping_expected(mapping, expected),
+    }
 }
 
 fn mapping_expected(mapping: Option<&Mapping>, expected: &[String]) -> Option<String> {
@@ -607,16 +652,14 @@ fn mapping_expected(mapping: Option<&Mapping>, expected: &[String]) -> Option<St
 
 pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
     let id_idx = config.id_idx;
-    // Without a unique id column we cannot number rows across parallel
-    // segments, so we fall back to a single sequential segment.
-    let thread_count = if id_idx.is_some() {
-        config.threads.max(1)
-    } else {
-        1
-    };
+    let thread_count = config.threads.max(1);
 
     let segments = segments_for(&config.path, config.delimiter, thread_count)?;
-    let row_base = if segments.len() <= 1 { Some(1) } else { None };
+
+    // Global row numbers need per-segment offsets, so when there is no id
+    // column we run a cheap parallel counting pass instead of serialising the
+    // whole validation.
+    let need_row_offsets = id_idx.is_none() && segments.len() > 1;
 
     let slots = Slots::build(plan, id_idx);
 
@@ -668,15 +711,43 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
         .build()
         .map_err(|e| format!("cannot create thread pool: {e}"))?;
 
-    // Pass 1 (auto mapping) and pass 2 (validation) each read the whole file.
+    // Pass 1 (auto mapping) and pass 2 (validation) each read the whole file;
+    // the optional counting pass does too.
     let progress = config.progress.as_ref();
     if let Some(progress) = progress {
         if progress.enabled() {
-            let passes: u64 = if auto_indices.is_empty() { 1 } else { 2 };
+            let mut passes: u64 = if auto_indices.is_empty() { 1 } else { 2 };
+            if need_row_offsets {
+                passes += 1;
+            }
             let file_size = std::fs::metadata(&config.path).map(|m| m.len()).unwrap_or(0);
             progress.set_total(file_size * passes);
         }
     }
+
+    // First row number (1-based) of each segment, or `None` when row numbers
+    // are not available (parallel run with an id column).
+    let row_bases: Vec<Option<u64>> = if segments.len() <= 1 {
+        vec![Some(1); segments.len()]
+    } else if need_row_offsets {
+        let counts: Vec<u64> = pool.install(|| {
+            segments
+                .par_iter()
+                .map(|&(from, to)| {
+                    count_rows_segment(&config.path, config.delimiter, from, to, progress)
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let mut bases = Vec::with_capacity(counts.len());
+        let mut next = 1u64;
+        for count in counts {
+            bases.push(Some(next));
+            next += count;
+        }
+        bases
+    } else {
+        vec![None; segments.len()]
+    };
 
     // Pass 1: extract auto mappings from the data.
     if !auto_indices.is_empty() {
@@ -715,7 +786,8 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
     let per_segment: Vec<Vec<RuleAccum>> = pool.install(|| {
         segments
             .par_iter()
-            .map(|&(from, to)| {
+            .zip(row_bases.par_iter())
+            .map(|(&(from, to), &row_base)| {
                 validate_segment(
                     &config.path,
                     config.delimiter,

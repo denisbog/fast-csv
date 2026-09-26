@@ -402,6 +402,43 @@ fn parallel_matches_sequential() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Without an id column, parallel validation still reports exact global row
+/// numbers (via a per-segment counting pass), so it matches sequential fully.
+#[test]
+fn parallel_without_id_keeps_row_numbers() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-noid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+
+    let mut csv = String::from(
+        "country_name,country_code,start_date,end_date,tags,ref_tags,city,city_code\n",
+    );
+    for i in 1..=3000u32 {
+        let country = if i % 3 == 0 { "France" } else { "USA" };
+        let code = if i % 97 == 0 { "FR" } else { "US" };
+        csv.push_str(&format!(
+            "{country},{code},2020-01-01,2020-01-0{},a;b,a;b,Paris,PAR\n",
+            (i % 9) + 1
+        ));
+    }
+    std::fs::write(&csv_path, csv).unwrap();
+
+    let rules = people_rules();
+    let csv_str = csv_path.to_str().unwrap();
+    let sequential = run_json(&[
+        csv_str, "-r", &rules, "-j", "1", "--format", "json", "--no-fail",
+    ]);
+    let parallel = run_json(&[
+        csv_str, "-r", &rules, "-j", "4", "--format", "json", "--no-fail",
+    ]);
+
+    // Row numbers are exact in both modes, so compare the reports verbatim.
+    assert_eq!(sequential, parallel);
+    assert_eq!(parallel["rows_checked"], 3000);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn strip_rows(mut report: Value) -> Value {
     if let Some(rules) = report["rules"].as_array_mut() {
         for rule in rules {

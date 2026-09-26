@@ -243,10 +243,13 @@ pub fn parse(text: &str) -> Result<Program, String> {
     let mut current_rule: Option<RuleDef> = None;
     let mut accumulator = String::new();
     let mut line_no = 0usize;
+    // Carried across lines so a `#` inside a multi-line quoted value is not
+    // mistaken for a comment.
+    let mut quote_state: Option<char> = None;
 
     for raw in text.lines() {
         line_no += 1;
-        let line = strip_comment(raw);
+        let line = strip_comment_state(raw, &mut quote_state);
         if accumulator.is_empty() && line.trim().is_empty() {
             continue;
         }
@@ -957,10 +960,10 @@ fn parse_rule_name(raw: &str) -> Option<String> {
     }
 }
 
-/// Strip a `#` comment that is not inside quotes.
-fn strip_comment(line: &str) -> String {
+/// Strip a `#` comment that is not inside quotes, carrying the quote state in
+/// and out so that multi-line quoted values are handled correctly.
+fn strip_comment_state(line: &str, quote: &mut Option<char>) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut quote: Option<char> = None;
     let mut escaped = false;
 
     for c in line.chars() {
@@ -969,13 +972,13 @@ fn strip_comment(line: &str) -> String {
             escaped = false;
             continue;
         }
-        match quote {
+        match *quote {
             Some(q) => {
                 if c == '\\' {
                     escaped = true;
                     out.push(c);
                 } else if c == q {
-                    quote = None;
+                    *quote = None;
                     out.push(c);
                 } else {
                     out.push(c);
@@ -983,7 +986,7 @@ fn strip_comment(line: &str) -> String {
             }
             None => {
                 if c == '"' || c == '\'' {
-                    quote = Some(c);
+                    *quote = Some(c);
                     out.push(c);
                 } else if c == '#' {
                     break;
@@ -994,6 +997,13 @@ fn strip_comment(line: &str) -> String {
         }
     }
     out
+}
+
+/// Strip a `#` comment that is not inside quotes (single line).
+#[cfg(test)]
+fn strip_comment(line: &str) -> String {
+    let mut quote = None;
+    strip_comment_state(line, &mut quote)
 }
 
 /// Whether quotes and value brackets are balanced (used for line continuation).
@@ -1292,6 +1302,13 @@ mod tests {
     #[test]
     fn comments_and_quotes() {
         assert_eq!(strip_comment(r#"a = "x # y" # real comment"#).trim(), r#"a = "x # y""#);
+    }
+
+    #[test]
+    fn hash_inside_multiline_string_is_not_a_comment() {
+        let src = "rule \"r\" {\n  left = a\n  right = b\n  pattern = \"x\n#y\"\n  compare = matches\n}\n";
+        let program = parse(src).unwrap();
+        assert_eq!(program.rules[0].pattern.as_ref().unwrap().as_str(), "x\n#y");
     }
 
     #[test]

@@ -90,6 +90,25 @@ pub fn merge_counts(into: &mut MapCounts, from: MapCounts) {
     }
 }
 
+/// Increment the observation count for `(left, right)`. Keys are allocated
+/// only when a pair is seen for the first time, so the common case does not
+/// allocate at all (`entry(left.into())` would box a string on every row).
+pub fn bump_counts(counts: &mut MapCounts, left: &str, right: &str) {
+    match counts.get_mut(left) {
+        Some(hits) => match hits.get_mut(right) {
+            Some(count) => *count += 1,
+            None => {
+                hits.insert(right.into(), 1);
+            }
+        },
+        None => {
+            let mut hits = HashMap::new();
+            hits.insert(right.into(), 1);
+            counts.insert(left.into(), hits);
+        }
+    }
+}
+
 /// Split a cell into tokens. When `multi` is false the whole value is a single
 /// token.
 /// Split a cell into tokens. When `multi` is false the whole value is a single
@@ -104,6 +123,37 @@ pub fn split_tokens<'a>(value: &'a str, multi: bool, separator: &Separator) -> V
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .collect()
+}
+
+/// Like [`split_tokens`], but writes owned tokens into a reusable buffer.
+/// Existing `String` slots are overwritten in place, so after the first row
+/// the hot loop performs no token allocation at all.
+pub fn split_tokens_into(value: &str, multi: bool, separator: &Separator, out: &mut Vec<String>) {
+    if !multi {
+        write_slot(out, 0, value);
+        out.truncate(1);
+        return;
+    }
+    let mut count = 0usize;
+    for token in separator.split(value) {
+        let token = token.trim();
+        if !token.is_empty() {
+            write_slot(out, count, token);
+            count += 1;
+        }
+    }
+    out.truncate(count);
+}
+
+#[inline]
+fn write_slot(out: &mut Vec<String>, index: usize, value: &str) {
+    match out.get_mut(index) {
+        Some(slot) => {
+            slot.clear();
+            slot.push_str(value);
+        }
+        None => out.push(value.to_string()),
+    }
 }
 
 /// Positional pairing between left and right tokens.
@@ -181,6 +231,7 @@ impl MappingCache {
         let mut counts: MapCounts = HashMap::new();
         let mut left_scratch = String::new();
         let mut right_scratch = String::new();
+        let mut part_buf = String::new();
         let mut left_key = String::new();
         let mut right_key = String::new();
 
@@ -215,6 +266,7 @@ impl MappingCache {
                     spec.join_separator,
                     spec.trim,
                     &mut left_scratch,
+                    &mut part_buf,
                     &mut left_key,
                 );
                 crate::transform::compose(
@@ -225,6 +277,7 @@ impl MappingCache {
                     spec.join_separator,
                     spec.trim,
                     &mut right_scratch,
+                    &mut part_buf,
                     &mut right_key,
                 );
 
@@ -232,11 +285,7 @@ impl MappingCache {
                 let right_tokens = split_tokens(&right_key, spec.multi, spec.value_separator);
 
                 for (l, r) in pair_tokens(&left_tokens, &right_tokens) {
-                    *counts
-                        .entry(l.into())
-                        .or_default()
-                        .entry(r.into())
-                        .or_insert(0) += 1;
+                    bump_counts(&mut counts, l, r);
                 }
             }
         }

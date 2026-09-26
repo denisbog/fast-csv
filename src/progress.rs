@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 const BAR_WIDTH: usize = 30;
 const REDRAW: Duration = Duration::from_millis(100);
+/// Only consider a redraw once this many bytes accumulated, keeping
+/// `Instant::now()` and the draw mutex out of the per-read hot path.
+const REDRAW_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug)]
 pub struct Progress {
@@ -18,6 +21,7 @@ pub struct Progress {
     total: AtomicU64,
     done: AtomicU64,
     started: Instant,
+    since_draw: AtomicU64,
     last_draw: Mutex<Instant>,
     draw_lock: Mutex<()>,
     finished: AtomicBool,
@@ -31,6 +35,7 @@ impl Progress {
             total: AtomicU64::new(0),
             done: AtomicU64::new(0),
             started: Instant::now(),
+            since_draw: AtomicU64::new(0),
             last_draw: Mutex::new(Instant::now()),
             draw_lock: Mutex::new(()),
             finished: AtomicBool::new(false),
@@ -48,9 +53,14 @@ impl Progress {
     /// Record `delta` processed units (bytes) and redraw if enough time passed.
     pub fn tick(&self, delta: u64) {
         self.done.fetch_add(delta, Ordering::Relaxed);
-        if !self.enabled || self.finished.load(Ordering::Relaxed) || delta == 0 {
+        if !self.enabled || delta == 0 || self.finished.load(Ordering::Relaxed) {
             return;
         }
+        let since = self.since_draw.fetch_add(delta, Ordering::Relaxed) + delta;
+        if since < REDRAW_BYTES {
+            return;
+        }
+        self.since_draw.store(0, Ordering::Relaxed);
         let now = Instant::now();
         {
             let mut last = self.last_draw.lock().unwrap();

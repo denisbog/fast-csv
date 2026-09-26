@@ -207,9 +207,16 @@ impl Transform {
     }
 }
 
-/// Apply a full pipeline into `out`. `out` is overwritten. Returns whether all
-/// steps succeeded.
-pub fn apply_pipeline(transforms: &[Transform], input: &str, out: &mut String) -> bool {
+/// Apply a full pipeline into `out`. `out` is overwritten and `scratch` is a
+/// caller-owned temporary reused across calls, so a multi-step pipeline does
+/// not allocate once the buffers are warm. Returns whether all steps
+/// succeeded.
+pub fn apply_pipeline(
+    transforms: &[Transform],
+    input: &str,
+    out: &mut String,
+    scratch: &mut String,
+) -> bool {
     out.clear();
     let Some((first, rest)) = transforms.split_first() else {
         out.push_str(input);
@@ -220,24 +227,23 @@ pub fn apply_pipeline(transforms: &[Transform], input: &str, out: &mut String) -
 
     // Two buffers are swapped explicitly (rather than reassigning a `&str`)
     // so the borrow checker is happy and no temporary allocation is needed.
-    let mut scratch = String::new();
-    let mut current_is_out = true;
+    let mut result_in_out = true;
 
     for transform in rest {
-        if current_is_out {
+        if result_in_out {
             scratch.clear();
-            ok &= transform.write_into(out, &mut scratch);
-            current_is_out = false;
+            ok &= transform.write_into(out, scratch);
+            result_in_out = false;
         } else {
             out.clear();
-            ok &= transform.write_into(&scratch, out);
-            current_is_out = true;
+            ok &= transform.write_into(scratch, out);
+            result_in_out = true;
         }
     }
 
-    if !current_is_out {
+    if !result_in_out {
         out.clear();
-        out.push_str(&scratch);
+        out.push_str(scratch);
     }
 
     ok
@@ -246,14 +252,15 @@ pub fn apply_pipeline(transforms: &[Transform], input: &str, out: &mut String) -
 /// Combine several already-extracted cell values into one composite key.
 ///
 /// Each part is optionally trimmed, then runs through `transforms`
-/// independently, then the results are joined with `join`. `scratch` is reused
-/// between parts, so no allocation is needed once it is warm, and the final key
-/// is written to `out`.
+/// independently, then the results are joined with `join`. `part` and `scratch`
+/// are caller-owned temporaries reused between parts (and across rows), so no
+/// allocation is needed once they are warm; the final key is written to `out`.
 pub fn compose<S, I>(
     parts: I,
     transforms: &[Transform],
     join: &str,
     trim: bool,
+    part: &mut String,
     scratch: &mut String,
     out: &mut String,
 ) -> bool
@@ -263,14 +270,14 @@ where
 {
     out.clear();
     let mut ok = true;
-    for (index, part) in parts.into_iter().enumerate() {
+    for (index, input) in parts.into_iter().enumerate() {
         if index > 0 {
             out.push_str(join);
         }
-        let part = part.as_ref();
-        let part = if trim { part.trim() } else { part };
-        ok &= apply_pipeline(transforms, part, scratch);
-        out.push_str(scratch);
+        let input = input.as_ref();
+        let input = if trim { input.trim() } else { input };
+        ok &= apply_pipeline(transforms, input, part, scratch);
+        out.push_str(part);
     }
     ok
 }
@@ -304,25 +311,110 @@ fn reparse_date(input: &str, inputs: &[String], output: &str) -> Option<String> 
     }
 
     for fmt in inputs {
+        // Fast path for the common fixed-width formats, so the chrono parser
+        // is only paid for unusual formats. Results are identical: a value
+        // that does not match falls through to chrono.
+        if let Some(dt) = fast_parse_date(value, fmt) {
+            return Some(format_output(dt, output));
+        }
         if let Ok(dt) = NaiveDateTime::parse_from_str(value, fmt) {
-            return Some(dt.format(output).to_string());
+            return Some(format_output(dt, output));
         }
         if let Ok(date) = NaiveDate::parse_from_str(value, fmt) {
             let dt = date.and_time(NaiveTime::MIN);
-            return Some(dt.format(output).to_string());
+            return Some(format_output(dt, output));
         }
     }
 
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(dt.naive_utc().format(output).to_string());
+        return Some(format_output(dt.naive_utc(), output));
     }
 
     None
 }
 
+/// Emit a parsed date, with a fast path for the most common output format.
+fn format_output(dt: NaiveDateTime, output: &str) -> String {
+    if output == "%Y-%m-%d" {
+        use chrono::Datelike;
+        format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
+    } else {
+        dt.format(output).to_string()
+    }
+}
+
+fn parse_uint(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + u32::from(byte - b'0');
+    }
+    Some(value)
+}
+
+/// Parse a handful of fixed-width date formats without going through chrono's
+/// generic parser. Returns `None` when the format is not special-cased or the
+/// value does not fit it (the caller then retries with chrono).
+fn fast_parse_date(value: &str, fmt: &str) -> Option<NaiveDateTime> {
+    let bytes = value.as_bytes();
+    let (year, month, day) = match fmt {
+        "%Y-%m-%d" => split_ymd(bytes, b'-')?,
+        "%Y/%m/%d" => split_ymd(bytes, b'/')?,
+        "%d/%m/%Y" => split_dmy(bytes, b'/')?,
+        "%d-%m-%Y" => split_dmy(bytes, b'-')?,
+        _ => return None,
+    };
+    NaiveDate::from_ymd_opt(year as i32, month, day)?.and_hms_opt(0, 0, 0)
+}
+
+fn split_ymd(bytes: &[u8], sep: u8) -> Option<(u32, u32, u32)> {
+    if bytes.len() != 10 || bytes[4] != sep || bytes[7] != sep {
+        return None;
+    }
+    Some((
+        parse_uint(&bytes[0..4])?,
+        parse_uint(&bytes[5..7])?,
+        parse_uint(&bytes[8..10])?,
+    ))
+}
+
+/// `DD<sep>MM<sep>YYYY` -> `(year, month, day)`.
+fn split_dmy(bytes: &[u8], sep: u8) -> Option<(u32, u32, u32)> {
+    if bytes.len() != 10 || bytes[2] != sep || bytes[5] != sep {
+        return None;
+    }
+    Some((
+        parse_uint(&bytes[6..10])?,
+        parse_uint(&bytes[3..5])?,
+        parse_uint(&bytes[0..2])?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_date_paths_match_chrono() {
+        for (fmt, value) in [
+            ("%Y-%m-%d", "2020-12-31"),
+            ("%Y/%m/%d", "2020/01/05"),
+            ("%d/%m/%Y", "31/12/2020"),
+            ("%d-%m-%Y", "05-01-2020"),
+        ] {
+            let fast = fast_parse_date(value, fmt).expect("fast path should parse");
+            let chrono = NaiveDateTime::parse_from_str(value, fmt)
+                .or_else(|_| NaiveDate::parse_from_str(value, fmt).map(|d| d.and_time(NaiveTime::MIN)))
+                .expect("chrono should parse");
+            assert_eq!(fast, chrono, "{fmt} {value}");
+        }
+        // Invalid dates and non-matching widths fall back to chrono.
+        assert!(fast_parse_date("2020-02-30", "%Y-%m-%d").is_none());
+        assert!(fast_parse_date("2020-2-3", "%Y-%m-%d").is_none());
+        assert!(fast_parse_date("2020-01-05", "%d/%m/%Y").is_none());
+    }
 
     #[test]
     fn dates_are_normalized() {
@@ -344,7 +436,8 @@ mod tests {
     fn pipeline_chains() {
         let pipeline = vec![Transform::Trim, Transform::Lower];
         let mut out = String::new();
-        assert!(apply_pipeline(&pipeline, "  HeLLo ", &mut out));
+        let mut scratch = String::new();
+        assert!(apply_pipeline(&pipeline, "  HeLLo ", &mut out, &mut scratch));
         assert_eq!(out, "hello");
     }
 
@@ -352,7 +445,8 @@ mod tests {
     fn pipeline_of_three() {
         let pipeline = vec![Transform::Trim, Transform::Upper, Transform::Suffix("!".into())];
         let mut out = String::new();
-        apply_pipeline(&pipeline, " ab ", &mut out);
+        let mut scratch = String::new();
+        apply_pipeline(&pipeline, " ab ", &mut out, &mut scratch);
         assert_eq!(out, "AB!");
     }
 
@@ -409,6 +503,7 @@ mod tests {
     #[test]
     fn composite_keys() {
         let transforms = vec![Transform::Trim, Transform::Lower];
+        let mut part = String::new();
         let mut scratch = String::new();
         let mut out = String::new();
         let ok = compose(
@@ -416,6 +511,7 @@ mod tests {
             &transforms,
             "|",
             true,
+            &mut part,
             &mut scratch,
             &mut out,
         );
@@ -429,6 +525,7 @@ mod tests {
             &[] as &[Transform],
             "|",
             false,
+            &mut part,
             &mut scratch,
             &mut untrimmed,
         );

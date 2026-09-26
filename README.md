@@ -58,7 +58,7 @@ cat data.csv | fvalidate - -r rules.vl --id-column id
 | --- | --- |
 | `-r, --rules <FILE>` | Rule DSL file (required). |
 | `-d, --delimiter <BYTE>` | Field delimiter; `\t`/`tab` accepted (default `,`). |
-| `--id-column <NAME>` | Column holding a unique value used to identify rows. Without it, processing falls back to a single sequential pass so row numbers stay exact. |
+| `--id-column <NAME>` | Column holding a unique value used to identify rows. Without it, a lightweight parallel counting pass still assigns exact global row numbers, so validation stays parallel. |
 | `-n, --examples <N>` | Number of example rows per rule (default `10`; overridable per rule). |
 | `-j, --threads <N>` | Worker threads (`0` = all cores). |
 | `--format <text\|json\|html>` | Report format (default `text`). |

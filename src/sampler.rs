@@ -58,6 +58,16 @@ impl<T> Sampler<T> {
 
     /// Offer a row. Rows whose id is already sampled are ignored.
     pub fn offer(&mut self, id: &str, payload: T) {
+        self.offer_with(id, || payload);
+    }
+
+    /// Like [`offer`], but builds the payload only if the row is actually
+    /// retained, so expensive example formatting is skipped for the vast
+    /// majority of rows.
+    pub fn offer_with<F>(&mut self, id: &str, make: F)
+    where
+        F: FnOnce() -> T,
+    {
         if self.limit == 0 {
             return;
         }
@@ -79,7 +89,7 @@ impl<T> Sampler<T> {
         self.heap.push(HeapEntry {
             priority,
             id: id.into(),
-            payload,
+            payload: make(),
         });
 
         while self.heap.len() > self.limit {
@@ -149,6 +159,22 @@ mod tests {
         for _ in 0..100 {
             sampler.offer("same", 1);
         }
+        assert_eq!(sampler.into_payloads().len(), 1);
+    }
+
+    #[test]
+    fn offer_with_builds_payloads_lazily() {
+        // With a limit of 1 only new record minima are retained, so the
+        // payload builder runs about `ln(n)` times instead of once per row.
+        let mut sampler = Sampler::new(1);
+        let mut built = 0usize;
+        for i in 0..1000 {
+            sampler.offer_with(&format!("id-{i}"), || {
+                built += 1;
+                i
+            });
+        }
+        assert!(built < 100, "built {built}");
         assert_eq!(sampler.into_payloads().len(), 1);
     }
 }
