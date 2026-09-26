@@ -65,8 +65,20 @@ cat data.csv | fvalidate - -r rules.vl --id-column id
 | `--title <TITLE>` | Title used by the HTML report. |
 | `-o, --output <FILE>` | Write the report to a file. |
 | `--no-fail` | Always exit `0`, even if rules fail. |
+| `--no-progress` | Disable the progress bar. |
 
 Exit code is `1` when at least one rule fails, `0` otherwise.
+
+While a large file is being read, a progress bar is drawn on **stderr** (only
+when stderr is a terminal, so piping the report is unaffected). It shows the
+share of the file processed, throughput and ETA, then prints a one-line summary:
+
+```
+[=============================>]  89% 28.7 MB / 32.1 MB  54.2 MB/s  ETA 00:01
+Processed 32.1 MB in 0.75s (42.5 MB/s)
+```
+
+Use `--no-progress` to turn it off.
 
 ## The rule DSL
 
@@ -124,7 +136,7 @@ several lines as long as brackets/quotes balance.
 
 | Key | Meaning |
 | --- | --- |
-| `left`, `right` | Columns to compare: a header name, `#index`, or a list of columns `[a, b]` forming a composite key. |
+| `left`, `right` | Columns to compare: a header name, `#index`, a list `[a, b]` forming a composite key, or a fallback `or(a, b, c)` that picks the first non-empty column. |
 | `transform_left`, `transform_right` | Normalization pipeline (see below). With several columns it is applied to **each** component before joining. |
 | `compare` | `eq` (default), `ne`, `subset`, `superset`, `intersect`, or regex `matches` / `not_matches`. Operates on token sets. |
 | `multi` | Split cells into multiple values before comparing (default `false`). |
@@ -133,6 +145,8 @@ several lines as long as brackets/quotes balance.
 | `pattern` | Rule-level regex used by `compare = matches` / `not_matches`; `right` may then be omitted. |
 | `trim` | Trim each extracted cell (and reference-file cell) before transforming (default `false`). |
 | `allow_empty` (alias `optional`) | When `true`, a row whose source and target are both empty is **skipped** instead of failed (default `false`). |
+| `validation_skipped` (aliases `skip_when`, `skip`) | A predicate; rows where it holds are counted as **skipped** (see [Row predicates](#row-predicates)). |
+| `mapping_filter` | A predicate; rows where it does **not** hold are excluded from auto-mapping extraction and skipped during validation. |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
 | `mapping_left`, `mapping_right` | Column(s) inside the reference files; lists are allowed. |
@@ -339,6 +353,51 @@ Run the bundled example:
 fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_id
 ```
 
+### Row predicates
+
+`validation_skipped` and `mapping_filter` take a small boolean expression over
+the row's cells. It is evaluated on the raw cell value (trimmed when
+`trim = true`), before any transform:
+
+| Predicate | Meaning |
+| --- | --- |
+| `in(col, ["a", "b"])` | the value is one of the listed strings (alias `one_of`) |
+| `any_in([a, b], ["x", "y"])` | at least one of the listed columns is one of the values |
+| `all_in([a, b], [...])` | every listed column is one of the values |
+| `eq(col, "v")` / `ne(col, "v")` | value equals / differs from `v` |
+| `empty(col)` / `not_empty(col)` | the value is empty / non-empty |
+| `and(...)`, `or(...)`, `not(...)` | combine predicates (aliases `all`, `any`) |
+| `true`, `false` | literals |
+
+`validation_skipped` generalizes `allow_empty`: whenever the predicate holds,
+the row is counted as `skipped` regardless of the source/target values.
+`mapping_filter` generalizes it further for mapping rules — only rows matching
+the filter contribute to an `auto` mapping, and non-matching rows are skipped.
+
+```text
+rule "only primary rows define the mapping" {
+  left           = or(country_name, country_name_short, country_name_en)
+  right          = country_code
+  mapping        = auto
+  mapping_filter = eq(row_kind, "primary")
+}
+
+rule "archived rows are not validated" {
+  left               = country_name
+  right              = country_code
+  mapping_files      = ["examples/country_codes.csv"]
+  mapping_left       = country_name
+  mapping_right      = country_code
+  validation_skipped = any_in([status, review_status], ["archived", "deleted"])
+}
+```
+
+Run the bundled example:
+
+```bash
+fvalidate examples/loose.csv -r examples/rules_filters.vl --id-column id
+```
+
 ## Project layout
 
 ```
@@ -350,6 +409,7 @@ src/
   compare.rs    set comparison operators
   mapping.rs    mapping storage, reference-file loading, ambiguity
   sampler.rs    bounded distinct min-hash reservoir
+  progress.rs   dependency-free stderr progress bar
   engine.rs     segment discovery + parallel passes + orchestration
   report.rs     report model and text/JSON rendering
 tests/
@@ -366,6 +426,9 @@ examples/
   members.csv   trim / optional-relation fixture
   country_codes.csv
   rules_optional.vl    trim + allow_empty example
+  loose.csv    fallback / skip / mapping_filter fixture
+  loose_map.csv
+  rules_filters.vl     or(...) + validation_skipped + mapping_filter example
 ```
 
 ## Tests

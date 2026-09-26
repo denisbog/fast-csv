@@ -3,6 +3,7 @@ mod dsl;
 mod engine;
 mod mapping;
 mod pattern;
+mod progress;
 mod report;
 mod rules;
 mod sampler;
@@ -69,6 +70,10 @@ struct Cli {
     /// Always exit with code 0, even when some rules fail.
     #[arg(long)]
     no_fail: bool,
+
+    /// Disable the progress bar (shown on stderr when it is a terminal).
+    #[arg(long)]
+    no_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -136,11 +141,14 @@ fn run(cli: Cli) -> Result<bool, String> {
         cli.threads
     };
 
+    let progress = progress::Progress::new(!cli.no_progress && progress::stderr_is_terminal());
+
     let config = EngineConfig {
         path: path.to_path_buf(),
         delimiter,
         threads,
         id_idx,
+        progress: Some(progress),
     };
 
     let report = engine::run(&plan, &config)?;

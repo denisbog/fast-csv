@@ -86,6 +86,59 @@ impl Value {
     }
 }
 
+/// How one side of a rule selects its value from a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnSpec {
+    /// One column, or several columns combined into a composite key.
+    Columns(Vec<String>),
+    /// First non-empty column wins: `or(a, b, c)`.
+    Or(Vec<String>),
+}
+
+impl ColumnSpec {
+    pub fn names(&self) -> &[String] {
+        match self {
+            ColumnSpec::Columns(names) | ColumnSpec::Or(names) => names,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names().is_empty()
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            ColumnSpec::Columns(names) => names.join(" + "),
+            ColumnSpec::Or(names) => format!("or({})", names.join(", ")),
+        }
+    }
+}
+
+/// A row-level boolean condition used by `validation_skipped` and
+/// `mapping_filter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Predicate {
+    /// `in(col, ["a", "b"])`: the value is one of the listed strings.
+    In { column: ColumnSpec, values: Vec<String> },
+    /// `any_in([a, b], [...])`: at least one column is one of the values.
+    AnyIn { columns: Vec<ColumnSpec>, values: Vec<String> },
+    /// `all_in([a, b], [...])`: every column is one of the values.
+    AllIn { columns: Vec<ColumnSpec>, values: Vec<String> },
+    /// `eq(col, "value")`.
+    Eq { column: ColumnSpec, value: String },
+    /// `ne(col, "value")`.
+    Ne { column: ColumnSpec, value: String },
+    /// `empty(col)`.
+    Empty { column: ColumnSpec },
+    /// `not_empty(col)`.
+    NotEmpty { column: ColumnSpec },
+    And(Vec<Predicate>),
+    Or(Vec<Predicate>),
+    Not(Box<Predicate>),
+    /// Literal `true` / `false`.
+    Const(bool),
+}
+
 #[derive(Debug, Clone)]
 pub enum MappingSourceDef {
     /// No mapping: left is compared as-is against right.
@@ -139,9 +192,9 @@ impl Default for RuleDefaults {
 #[derive(Debug, Clone)]
 pub struct RuleDef {
     pub name: String,
-    /// One column, or several columns combined into a composite key.
-    pub left: Vec<String>,
-    pub right: Vec<String>,
+    /// One column, a composite key (`[a, b]`) or a fallback (`or(a, b, c)`).
+    pub left: ColumnSpec,
+    pub right: ColumnSpec,
     pub transform_left: Vec<Transform>,
     pub transform_right: Vec<Transform>,
     pub compare: Option<CompareOp>,
@@ -152,6 +205,12 @@ pub struct RuleDef {
     pub pattern: Option<Regex>,
     pub trim: Option<bool>,
     pub allow_empty: Option<bool>,
+    /// When this predicate holds, the row is counted as skipped instead of
+    /// being validated.
+    pub skip: Option<Predicate>,
+    /// Rows where this predicate is false are excluded from mapping extraction
+    /// and skipped during validation.
+    pub mapping_filter: Option<Predicate>,
     pub mapping: MappingSourceDef,
     pub report_limit: Option<usize>,
 }
@@ -218,8 +277,8 @@ pub fn parse(text: &str) -> Result<Program, String> {
                 module = Some(Module::Rule);
                 current_rule = Some(RuleDef {
                     name,
-                    left: Vec::new(),
-                    right: Vec::new(),
+                    left: ColumnSpec::Columns(Vec::new()),
+                    right: ColumnSpec::Columns(Vec::new()),
                     transform_left: Vec::new(),
                     transform_right: Vec::new(),
                     compare: None,
@@ -229,6 +288,8 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     pattern: None,
                     trim: None,
                     allow_empty: None,
+                    skip: None,
+                    mapping_filter: None,
                     mapping: MappingSourceDef::None,
                     report_limit: None,
                 });
@@ -326,8 +387,8 @@ fn apply_rule_key(
     line_no: usize,
 ) -> Result<(), String> {
     match key {
-        "left" => rule.left = expect_string_or_list(value, key, line_no)?,
-        "right" => rule.right = expect_string_or_list(value, key, line_no)?,
+        "left" => rule.left = expect_columns(value, key, line_no)?,
+        "right" => rule.right = expect_columns(value, key, line_no)?,
         "transform_left" => rule.transform_left = parse_transforms(value, line_no)?,
         "transform_right" => rule.transform_right = parse_transforms(value, line_no)?,
         "compare" => {
@@ -342,6 +403,10 @@ fn apply_rule_key(
         "pattern" => rule.pattern = Some(compile_pattern(value, key, line_no)?),
         "trim" => rule.trim = Some(expect_bool(value, key, line_no)?),
         "allow_empty" | "optional" => rule.allow_empty = Some(expect_bool(value, key, line_no)?),
+        "validation_skipped" | "skip_when" | "skip" => {
+            rule.skip = Some(parse_predicate(value, key, line_no)?)
+        }
+        "mapping_filter" => rule.mapping_filter = Some(parse_predicate(value, key, line_no)?),
         "report_limit" => rule.report_limit = Some(expect_usize(value, key, line_no)?),
         "mapping" => {
             let raw = expect_string_ref(value, key, line_no)?;
@@ -481,6 +546,228 @@ fn expect_string_or_list(
             .map(|s| vec![s.to_string()])
             .ok_or_else(|| format!("line {line_no}: `{key}` expects a column name or a list")),
     }
+}
+
+/// Parse a `left`/`right` value: a column name, a composite list `[a, b]`, or
+/// a fallback `or(a, b, c)` (aliases: `coalesce`, `first`).
+fn expect_columns(value: &Value, key: &str, line_no: usize) -> Result<ColumnSpec, String> {
+    match value {
+        Value::List(items) => {
+            let names = parse_column_names(items, key, line_no)?;
+            if names.is_empty() {
+                return Err(format!("line {line_no}: `{key}` list must not be empty"));
+            }
+            Ok(ColumnSpec::Columns(names))
+        }
+        Value::Call(name, args) if is_or_name(name) => {
+            let mut names = Vec::new();
+            for arg in args {
+                match arg {
+                    Value::List(items) => {
+                        names.extend(parse_column_names(items, key, line_no)?)
+                    }
+                    other => names.push(
+                        other
+                            .as_str()
+                            .ok_or_else(|| {
+                                format!("line {line_no}: `{key}` or(...) expects column names")
+                            })?
+                            .to_string(),
+                    ),
+                }
+            }
+            if names.is_empty() {
+                return Err(format!(
+                    "line {line_no}: `{key}` or(...) needs at least one column"
+                ));
+            }
+            Ok(ColumnSpec::Or(names))
+        }
+        other => other
+            .as_str()
+            .map(|s| ColumnSpec::Columns(vec![s.to_string()]))
+            .ok_or_else(|| {
+                format!("line {line_no}: `{key}` expects a column name, a list or or(...)")
+            }),
+    }
+}
+
+fn is_or_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "or" | "coalesce" | "first" | "first_non_empty"
+    )
+}
+
+fn parse_column_names(
+    items: &[Value],
+    key: &str,
+    line_no: usize,
+) -> Result<Vec<String>, String> {
+    items
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                format!("line {line_no}: `{key}` list must contain column names")
+            })
+        })
+        .collect()
+}
+
+/// Parse a boolean row predicate (`validation_skipped`, `mapping_filter`).
+fn parse_predicate(value: &Value, key: &str, line_no: usize) -> Result<Predicate, String> {
+    let invalid = || format!("line {line_no}: `{key}` expects a predicate");
+    match value {
+        Value::Call(name, args) => {
+            let lower = name.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                "in" | "one_of" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::In {
+                        column: expect_columns(&args[0], key, line_no)?,
+                        values: expect_value_list(&args[1], key, line_no)?,
+                    })
+                }
+                "not_in" | "nin" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::Not(Box::new(Predicate::In {
+                        column: expect_columns(&args[0], key, line_no)?,
+                        values: expect_value_list(&args[1], key, line_no)?,
+                    })))
+                }
+                "any_in" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::AnyIn {
+                        columns: expect_column_group(&args[0], key, line_no)?,
+                        values: expect_value_list(&args[1], key, line_no)?,
+                    })
+                }
+                "all_in" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::AllIn {
+                        columns: expect_column_group(&args[0], key, line_no)?,
+                        values: expect_value_list(&args[1], key, line_no)?,
+                    })
+                }
+                "eq" | "equals" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::Eq {
+                        column: expect_columns(&args[0], key, line_no)?,
+                        value: expect_string(&args[1], key, line_no)?,
+                    })
+                }
+                "ne" | "neq" | "not_eq" | "not_equals" => {
+                    expect_arity(args, 2, name, line_no)?;
+                    Ok(Predicate::Ne {
+                        column: expect_columns(&args[0], key, line_no)?,
+                        value: expect_string(&args[1], key, line_no)?,
+                    })
+                }
+                "empty" | "is_empty" => {
+                    expect_arity(args, 1, name, line_no)?;
+                    Ok(Predicate::Empty {
+                        column: expect_columns(&args[0], key, line_no)?,
+                    })
+                }
+                "not_empty" | "notempty" | "non_empty" | "is_not_empty" => {
+                    expect_arity(args, 1, name, line_no)?;
+                    Ok(Predicate::NotEmpty {
+                        column: expect_columns(&args[0], key, line_no)?,
+                    })
+                }
+                "and" | "all" => {
+                    let parts = flatten_predicates(args, key, line_no)?;
+                    Ok(Predicate::And(parts))
+                }
+                "or" | "any" => {
+                    let parts = flatten_predicates(args, key, line_no)?;
+                    Ok(Predicate::Or(parts))
+                }
+                "not" => {
+                    expect_arity(args, 1, name, line_no)?;
+                    Ok(Predicate::Not(Box::new(parse_predicate(
+                        &args[0], key, line_no,
+                    )?)))
+                }
+                other => Err(format!(
+                    "line {line_no}: unknown predicate `{other}` (try in, any_in, all_in, eq, ne, empty, not_empty, and, or, not)"
+                )),
+            }
+        }
+        Value::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "always" | "yes" => Ok(Predicate::Const(true)),
+            "false" | "never" | "no" => Ok(Predicate::Const(false)),
+            other => Err(format!("line {line_no}: unknown predicate `{other}`")),
+        },
+        _ => Err(invalid()),
+    }
+}
+
+fn flatten_predicates(args: &[Value], key: &str, line_no: usize) -> Result<Vec<Predicate>, String> {
+    if args.is_empty() {
+        return Err(format!("line {line_no}: `{key}` needs at least one predicate"));
+    }
+    let mut out = Vec::new();
+    for arg in args {
+        match arg {
+            Value::List(items) => {
+                for item in items {
+                    out.push(parse_predicate(item, key, line_no)?);
+                }
+            }
+            other => out.push(parse_predicate(other, key, line_no)?),
+        }
+    }
+    Ok(out)
+}
+
+/// A list of columns or a single column, as used by `any_in` / `all_in`.
+fn expect_column_group(
+    value: &Value,
+    key: &str,
+    line_no: usize,
+) -> Result<Vec<ColumnSpec>, String> {
+    match value {
+        Value::List(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(|s| ColumnSpec::Columns(vec![s.to_string()]))
+                    .ok_or_else(|| {
+                        format!("line {line_no}: `{key}` list must contain column names")
+                    })
+            })
+            .collect(),
+        other => Ok(vec![expect_columns(other, key, line_no)?]),
+    }
+}
+
+/// A list of literal strings, or a single string treated as a one-element list.
+fn expect_value_list(value: &Value, key: &str, line_no: usize) -> Result<Vec<String>, String> {
+    match value {
+        Value::List(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    format!("line {line_no}: `{key}` list must contain strings")
+                })
+            })
+            .collect(),
+        other => other
+            .as_str()
+            .map(|s| vec![s.to_string()])
+            .ok_or_else(|| format!("line {line_no}: `{key}` expects a list of strings")),
+    }
+}
+
+fn expect_arity(args: &[Value], expected: usize, name: &str, line_no: usize) -> Result<(), String> {
+    if args.len() != expected {
+        return Err(format!(
+            "line {line_no}: `{name}(...)` expects {expected} argument(s), got {}",
+            args.len()
+        ));
+    }
+    Ok(())
 }
 
 fn expect_string_ref<'a>(value: &'a Value, key: &str, line_no: usize) -> Result<&'a str, String> {
@@ -948,8 +1235,11 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         let rule = &program.rules[0];
-        assert_eq!(rule.left, vec!["a", "b"]);
-        assert_eq!(rule.right, vec!["c"]);
+        assert_eq!(
+            rule.left,
+            ColumnSpec::Columns(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(rule.right, ColumnSpec::Columns(vec!["c".into()]));
         assert_eq!(rule.join_separator.as_deref(), Some("|"));
         match &rule.mapping {
             MappingSourceDef::Files { left, right, .. } => {
@@ -1002,5 +1292,74 @@ mod tests {
     #[test]
     fn comments_and_quotes() {
         assert_eq!(strip_comment(r#"a = "x # y" # real comment"#).trim(), r#"a = "x # y""#);
+    }
+
+    #[test]
+    fn parses_or_fallback_columns() {
+        let src = r#"
+            rule "r" {
+              left = or(country_name, country_short, country_en)
+              right = country_code
+            }
+        "#;
+        let program = parse(src).unwrap();
+        assert_eq!(
+            program.rules[0].left,
+            ColumnSpec::Or(vec![
+                "country_name".into(),
+                "country_short".into(),
+                "country_en".into()
+            ])
+        );
+        assert_eq!(program.rules[0].left.display(), "or(country_name, country_short, country_en)");
+    }
+
+    #[test]
+    fn parses_validation_skipped_and_mapping_filter() {
+        let src = r#"
+            rule "r" {
+              left = code
+              right = expected
+              validation_skipped = any_in([col1, col2, col3], ["val1", "val2"])
+              mapping_filter = eq(kind, "primary")
+            }
+            rule "single" {
+              left = code
+              right = expected
+              validation_skipped = in(status, ["archived", "deleted"])
+            }
+        "#;
+        let program = parse(src).unwrap();
+        match program.rules[0].skip.as_ref().unwrap() {
+            Predicate::AnyIn { columns, values } => {
+                assert_eq!(columns.len(), 3);
+                assert_eq!(values, &["val1".to_string(), "val2".to_string()]);
+            }
+            other => panic!("expected AnyIn, got {other:?}"),
+        }
+        assert_eq!(
+            program.rules[0].mapping_filter,
+            Some(Predicate::Eq {
+                column: ColumnSpec::Columns(vec!["kind".into()]),
+                value: "primary".into(),
+            })
+        );
+        assert!(matches!(
+            program.rules[1].skip.as_ref().unwrap(),
+            Predicate::In { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_predicate() {
+        let src = r#"
+            rule "r" {
+              left = a
+              right = b
+              validation_skipped = bogus(a, ["x"])
+            }
+        "#;
+        let error = parse(src).unwrap_err();
+        assert!(error.contains("unknown predicate"), "{error}");
     }
 }

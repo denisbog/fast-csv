@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use simd_csv::ByteRecord;
@@ -23,12 +24,13 @@ use simd_csv::ByteRecord;
 use crate::compare::CompareOp;
 use crate::mapping::{self, MapCounts, Mapping, MappingOrigin};
 use crate::pattern::Separator;
+use crate::progress::Progress;
 use crate::report::{
     AmbiguityReport, Example, MappingEntry, MappingReport, Report, RuleReport, TargetExample,
 };
-use crate::rules::{MappingPlan, Plan};
+use crate::rules::{ColumnRef, CompiledPredicate, MappingPlan, Plan};
 use crate::sampler::Sampler;
-use crate::transform::compose;
+use crate::transform::{compose, Transform};
 
 const BUFFER_CAPACITY: usize = 64 * 1024;
 
@@ -38,6 +40,7 @@ pub struct EngineConfig {
     pub delimiter: u8,
     pub threads: usize,
     pub id_idx: Option<usize>,
+    pub progress: Option<Arc<Progress>>,
 }
 
 /// Read the header row of the main input.
@@ -83,24 +86,45 @@ pub fn segments_for(
     Ok(ranges.into_iter().filter(|(from, to)| to > from).collect())
 }
 
+/// A `Read` adapter that reports how many bytes were consumed.
+struct CountingReader<R> {
+    inner: R,
+    progress: Option<Arc<Progress>>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if let Some(progress) = &self.progress {
+            progress.tick(read as u64);
+        }
+        Ok(read)
+    }
+}
+
 fn open_segment(
     path: &Path,
     delimiter: u8,
     from: u64,
     to: u64,
-) -> Result<simd_csv::Reader<std::io::Take<File>>, String> {
+    progress: Option<&Arc<Progress>>,
+) -> Result<simd_csv::Reader<CountingReader<std::io::Take<File>>>, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     file.seek(SeekFrom::Start(from))
         .map_err(|e| format!("cannot seek {}: {e}", path.display()))?;
 
     let limited = file.take(to.saturating_sub(from));
+    let counted = CountingReader {
+        inner: limited,
+        progress: progress.cloned(),
+    };
     let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
     builder
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true);
 
-    Ok(builder.from_reader(limited))
+    Ok(builder.from_reader(counted))
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +177,8 @@ impl RuleAccum {
 /// repeatedly hashing header names.
 struct Slots {
     needed: Vec<usize>,
-    /// Per rule: the slots of the left columns and of the right columns.
-    rule_slots: Vec<(Vec<usize>, Vec<usize>)>,
+    /// Maps a CSV column index to its position in the extracted cell vector.
+    slot_of: Vec<usize>,
     id_slot: Option<usize>,
 }
 
@@ -162,8 +186,14 @@ impl Slots {
     fn build(plan: &Plan, id_idx: Option<usize>) -> Self {
         let mut needed: Vec<usize> = Vec::with_capacity(plan.rules.len() * 2 + 1);
         for rule in &plan.rules {
-            needed.extend(rule.left_idx.iter().copied());
-            needed.extend(rule.right_idx.iter().copied());
+            needed.extend_from_slice(rule.left.indices());
+            needed.extend_from_slice(rule.right.indices());
+            if let Some(predicate) = &rule.skip {
+                predicate.collect_indices(&mut needed);
+            }
+            if let Some(predicate) = &rule.mapping_filter {
+                predicate.collect_indices(&mut needed);
+            }
         }
         if let Some(id) = id_idx {
             needed.push(id);
@@ -171,31 +201,24 @@ impl Slots {
         needed.sort_unstable();
         needed.dedup();
 
-        let rule_slots = plan
-            .rules
-            .iter()
-            .map(|rule| {
-                let left = rule
-                    .left_idx
-                    .iter()
-                    .map(|&column| needed.binary_search(&column).unwrap())
-                    .collect();
-                let right = rule
-                    .right_idx
-                    .iter()
-                    .map(|&column| needed.binary_search(&column).unwrap())
-                    .collect();
-                (left, right)
-            })
-            .collect();
-
-        let id_slot = id_idx.map(|id| needed.binary_search(&id).unwrap());
+        let width = needed.last().map_or(0, |&column| column + 1);
+        let mut slot_of = vec![usize::MAX; width];
+        for (slot, &column) in needed.iter().enumerate() {
+            slot_of[column] = slot;
+        }
+        let id_slot = id_idx.map(|id| slot_of[id]);
 
         Slots {
             needed,
-            rule_slots,
+            slot_of,
             id_slot,
         }
+    }
+
+    /// The extracted cell for a CSV column (empty when the row is short).
+    #[inline]
+    fn cell<'a>(&self, cells: &'a [String], column: usize) -> &'a str {
+        cells[self.slot_of[column]].as_str()
     }
 
     #[inline]
@@ -212,6 +235,113 @@ impl Slots {
     }
 }
 
+/// Compose one side of a rule into `out`. `Or` selects the first non-empty
+/// candidate column before applying the transform pipeline.
+#[allow(clippy::too_many_arguments)]
+fn compose_side(
+    side: &ColumnRef,
+    cells: &[String],
+    slots: &Slots,
+    transforms: &[Transform],
+    join: &str,
+    trim: bool,
+    scratch: &mut String,
+    out: &mut String,
+) -> bool {
+    match side {
+        ColumnRef::Columns(columns) => compose(
+            columns.iter().map(|&column| slots.cell(cells, column)),
+            transforms,
+            join,
+            trim,
+            scratch,
+            out,
+        ),
+        ColumnRef::Or(columns) => {
+            let chosen = columns
+                .iter()
+                .map(|&column| slots.cell(cells, column))
+                .find(|value| !(if trim { value.trim() } else { *value }).is_empty());
+            match chosen {
+                Some(value) => compose(
+                    std::iter::once(value),
+                    transforms,
+                    join,
+                    trim,
+                    scratch,
+                    out,
+                ),
+                None => {
+                    out.clear();
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// The trimmed (or raw) single value a predicate looks at, or `None` when the
+/// selected column(s) are empty.
+#[inline]
+fn predicate_value<'a>(
+    side: &ColumnRef,
+    cells: &'a [String],
+    slots: &Slots,
+    trim: bool,
+) -> Option<&'a str> {
+    let normalize = |value: &'a str| if trim { value.trim() } else { value };
+    match side {
+        ColumnRef::Columns(columns) => {
+            let value = normalize(slots.cell(cells, columns[0]));
+            (!value.is_empty()).then_some(value)
+        }
+        ColumnRef::Or(columns) => columns
+            .iter()
+            .map(|&column| normalize(slots.cell(cells, column)))
+            .find(|value| !value.is_empty()),
+    }
+}
+
+fn eval_predicate(
+    predicate: &CompiledPredicate,
+    cells: &[String],
+    slots: &Slots,
+    trim: bool,
+) -> bool {
+    match predicate {
+        CompiledPredicate::Const(value) => *value,
+        CompiledPredicate::In { column, values } => predicate_value(column, cells, slots, trim)
+            .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
+        CompiledPredicate::AnyIn { columns, values } => columns.iter().any(|column| {
+            predicate_value(column, cells, slots, trim)
+                .is_some_and(|value| values.iter().any(|candidate| candidate == value))
+        }),
+        CompiledPredicate::AllIn { columns, values } => columns.iter().all(|column| {
+            predicate_value(column, cells, slots, trim)
+                .is_some_and(|value| values.iter().any(|candidate| candidate == value))
+        }),
+        CompiledPredicate::Eq { column, value } => {
+            predicate_value(column, cells, slots, trim) == Some(value.as_str())
+        }
+        CompiledPredicate::Ne { column, value } => {
+            predicate_value(column, cells, slots, trim) != Some(value.as_str())
+        }
+        CompiledPredicate::Empty { column } => {
+            predicate_value(column, cells, slots, trim).is_none()
+        }
+        CompiledPredicate::NotEmpty { column } => {
+            predicate_value(column, cells, slots, trim).is_some()
+        }
+        CompiledPredicate::And(parts) => parts
+            .iter()
+            .all(|part| eval_predicate(part, cells, slots, trim)),
+        CompiledPredicate::Or(parts) => parts
+            .iter()
+            .any(|part| eval_predicate(part, cells, slots, trim)),
+        CompiledPredicate::Not(inner) => !eval_predicate(inner, cells, slots, trim),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pass 1: build auto mappings
 // ---------------------------------------------------------------------------
@@ -225,6 +355,7 @@ fn fill_tokens(buffer: &str, multi: bool, separator: &Separator, out: &mut Vec<S
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_counts_segment(
     path: &Path,
     delimiter: u8,
@@ -233,9 +364,10 @@ fn build_counts_segment(
     slots: &Slots,
     from: u64,
     to: u64,
+    progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<MapCounts>, String> {
     let mut result: Vec<MapCounts> = auto_indices.iter().map(|_| MapCounts::new()).collect();
-    let mut reader = open_segment(path, delimiter, from, to)?;
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
     let mut record = ByteRecord::new();
     let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
     let mut left_buf = String::new();
@@ -255,18 +387,34 @@ fn build_counts_segment(
 
         for (position, &rule_index) in auto_indices.iter().enumerate() {
             let rule = &rules[rule_index];
-            let (left_slots, right_slots) = &slots.rule_slots[rule_index];
 
-            compose(
-                left_slots.iter().map(|&slot| cells[slot].as_str()),
+            // Rows skipped for validation, or excluded by the mapping filter,
+            // do not contribute to an auto-extracted mapping.
+            if let Some(predicate) = &rule.skip {
+                if eval_predicate(predicate, &cells, slots, rule.trim) {
+                    continue;
+                }
+            }
+            if let Some(predicate) = &rule.mapping_filter {
+                if !eval_predicate(predicate, &cells, slots, rule.trim) {
+                    continue;
+                }
+            }
+
+            compose_side(
+                &rule.left,
+                &cells,
+                slots,
                 &rule.transform_left,
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
                 &mut left_buf,
             );
-            compose(
-                right_slots.iter().map(|&slot| cells[slot].as_str()),
+            compose_side(
+                &rule.right,
+                &cells,
+                slots,
                 &rule.transform_right,
                 &rule.join_separator,
                 rule.trim,
@@ -304,12 +452,13 @@ fn validate_segment(
     from: u64,
     to: u64,
     row_base: Option<u64>,
+    progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<RuleAccum>, String> {
     let mut accums: Vec<RuleAccum> = rules
         .iter()
         .map(|rule| RuleAccum::new(rule.report_limit))
         .collect();
-    let mut reader = open_segment(path, delimiter, from, to)?;
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
     let mut record = ByteRecord::new();
     let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
 
@@ -336,18 +485,38 @@ fn validate_segment(
 
         for (rule_index, rule) in rules.iter().enumerate() {
             let accum = &mut accums[rule_index];
-            let (left_slots, right_slots) = &slots.rule_slots[rule_index];
 
-            let left_ok = compose(
-                left_slots.iter().map(|&slot| cells[slot].as_str()),
+            // An explicit `validation_skipped` predicate, or a `mapping_filter`
+            // that does not match, marks the row as skipped.
+            if let Some(predicate) = &rule.skip {
+                if eval_predicate(predicate, &cells, slots, rule.trim) {
+                    accum.checked += 1;
+                    accum.skipped += 1;
+                    continue;
+                }
+            }
+            if let Some(predicate) = &rule.mapping_filter {
+                if !eval_predicate(predicate, &cells, slots, rule.trim) {
+                    accum.checked += 1;
+                    accum.skipped += 1;
+                    continue;
+                }
+            }
+
+            let left_ok = compose_side(
+                &rule.left,
+                &cells,
+                slots,
                 &rule.transform_left,
                 &rule.join_separator,
                 rule.trim,
                 &mut component_buf,
                 &mut left_buf,
             );
-            let right_ok = compose(
-                right_slots.iter().map(|&slot| cells[slot].as_str()),
+            let right_ok = compose_side(
+                &rule.right,
+                &cells,
+                slots,
                 &rule.transform_right,
                 &rule.join_separator,
                 rule.trim,
@@ -551,6 +720,16 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
         .build()
         .map_err(|e| format!("cannot create thread pool: {e}"))?;
 
+    // Pass 1 (auto mapping) and pass 2 (validation) each read the whole file.
+    let progress = config.progress.as_ref();
+    if let Some(progress) = progress {
+        if progress.enabled() {
+            let passes: u64 = if auto_indices.is_empty() { 1 } else { 2 };
+            let file_size = std::fs::metadata(&config.path).map(|m| m.len()).unwrap_or(0);
+            progress.set_total(file_size * passes);
+        }
+    }
+
     // Pass 1: extract auto mappings from the data.
     if !auto_indices.is_empty() {
         let per_segment: Vec<Vec<MapCounts>> = pool.install(|| {
@@ -565,6 +744,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                         &slots,
                         from,
                         to,
+                        progress,
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()
@@ -596,6 +776,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                     from,
                     to,
                     row_base,
+                    progress,
                 )
             })
             .collect::<Result<Vec<_>, String>>()
@@ -610,6 +791,10 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
         for (index, accum) in segment.into_iter().enumerate() {
             accums[index].merge(accum);
         }
+    }
+
+    if let Some(progress) = progress {
+        progress.finish();
     }
 
     Ok(build_report(plan, accums, mappings))

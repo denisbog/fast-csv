@@ -265,6 +265,51 @@ fn trim_and_optional_empty() {
     assert_eq!(rules[1]["unmapped_values"], 2);
 }
 
+/// `or(...)` fallback columns, `validation_skipped` predicates and
+/// `mapping_filter`.
+#[test]
+fn fallback_skip_and_mapping_filter() {
+    let report = run_json(&[
+        &manifest("examples/loose.csv"),
+        "-r",
+        &manifest("examples/rules_filters.vl"),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    assert_eq!(report["rows_checked"], 7);
+    let rules = report["rules"].as_array().unwrap();
+
+    // `or(a, b, c)` uses the first non-empty column; rows 6 and 7 disagree.
+    assert_eq!(rules[0]["left"], "or(code_a, code_b, code_c)");
+    assert_eq!(rules[0]["rows_passed"], 4);
+    assert_eq!(rules[0]["rows_failed"], 3);
+    assert_eq!(rules[0]["rows_skipped"], 0);
+
+    // `validation_skipped = in(status, [...])` skips row 4 (archived).
+    assert_eq!(rules[1]["rows_skipped"], 1);
+    assert_eq!(rules[1]["rows_failed"], 3);
+
+    // `validation_skipped = any_in([...], [...])` skips row 7 (code SKIP).
+    assert_eq!(rules[2]["rows_skipped"], 1);
+    assert_eq!(rules[2]["rows_failed"], 2);
+
+    // A reference mapping with `mapping_filter = eq(kind, "primary")` skips
+    // the secondary row.
+    assert_eq!(rules[3]["rows_skipped"], 1);
+    assert_eq!(rules[3]["rows_failed"], 2);
+
+    // The auto-extracted mapping must only see primary rows, so the filtered
+    // out `FR -> ZZ` row does not make `FR` ambiguous.
+    assert_eq!(rules[4]["mapping"]["distinct_inputs"], 6);
+    assert_eq!(rules[4]["mapping"]["ambiguous_inputs"], 0);
+    assert_eq!(rules[4]["rows_skipped"], 1);
+    assert_eq!(rules[4]["rows_failed"], 0);
+}
+
 /// xan-style regex: `regex(...)` in transforms, a rule `pattern`, and a
 /// regex separator.
 #[test]
