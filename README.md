@@ -287,8 +287,10 @@ the end); pass 2 validates against it.
 The report is available as human-readable text (`--format text`, default),
 machine-readable JSON (`--format json`) or as a **self-contained HTML page**
 (`--format html`, no external assets, light/dark aware, all values
-HTML-escaped). For every rule
-it contains:
+HTML-escaped). The HTML report opens with an **outline** — one row per rule,
+sorted by target column — showing the validation summary (status, checked,
+passed, failed, skipped); click a rule name to jump to its section, and use the
+“↑ outline” link there to return. For every rule the report contains:
 
 * the number of rows checked, passed, **skipped** and failed;
 * transform errors and unmapped values;

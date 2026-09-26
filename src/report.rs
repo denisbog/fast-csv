@@ -216,15 +216,60 @@ impl Report {
             rows = self.rows_checked,
         );
 
-        for (index, rule) in self.rules.iter().enumerate() {
-            let status = if rule.passed() { "passed" } else { "failed" };
+        // Outline: one row per rule, sorted by the target column, summarising
+        // the validation result and linking to the rule's section.
+        let mut order: Vec<usize> = (0..self.rules.len()).collect();
+        order.sort_by(|&a, &b| {
+            let ra = &self.rules[a];
+            let rb = &self.rules[b];
+            ra.right
+                .to_lowercase()
+                .cmp(&rb.right.to_lowercase())
+                .then_with(|| ra.left.to_lowercase().cmp(&rb.left.to_lowercase()))
+                .then_with(|| a.cmp(&b))
+        });
 
-            let _ = writeln!(out, "<section class=\"rule {status}\">");
+        let _ = writeln!(
+            out,
+            "<nav class=\"outline\" id=\"outline\"><h2>Outline</h2>\
+             <div class=\"table-scroll\"><table><thead><tr>\
+             <th>target</th><th>source</th><th>rule</th><th>status</th>\
+             <th>checked</th><th>passed</th><th>failed</th><th>skipped</th>\
+             </tr></thead><tbody>"
+        );
+        for &index in &order {
+            let rule = &self.rules[index];
+            let status = if rule.passed() { "passed" } else { "failed" };
             let _ = writeln!(
                 out,
-                "<header><h2>{}. {}</h2><span class=\"badge {status}\">{status}</span></header>",
-                index + 1,
-                html_escape(&rule.name),
+                "<tr><td><code>{target}</code></td><td><code>{source}</code></td>\
+                 <td><a href=\"#rule-{anchor}\">{name}</a></td>\
+                 <td><span class=\"badge {status}\">{status}</span></td>\
+                 <td>{checked}</td><td class=\"pass\">{passed}</td>\
+                 <td class=\"fail\">{failed}</td><td>{skipped}</td></tr>",
+                target = html_escape(&rule.right),
+                source = html_escape(&rule.left),
+                anchor = index + 1,
+                name = html_escape(&rule.name),
+                checked = rule.rows_checked,
+                passed = rule.rows_passed,
+                failed = rule.rows_failed,
+                skipped = rule.rows_skipped,
+            );
+        }
+        out.push_str("</tbody></table></div></nav>\n");
+
+        for (index, rule) in self.rules.iter().enumerate() {
+            let status = if rule.passed() { "passed" } else { "failed" };
+            let anchor = index + 1;
+
+            let _ = writeln!(out, "<section class=\"rule {status}\" id=\"rule-{anchor}\">");
+            let _ = writeln!(
+                out,
+                "<header><h2>{anchor}. {name}</h2>\
+                 <div class=\"actions\"><span class=\"badge {status}\">{status}</span>\
+                 <a class=\"back\" href=\"#outline\">&uarr; outline</a></div></header>",
+                name = html_escape(&rule.name),
             );
             let _ = writeln!(
                 out,
@@ -332,12 +377,24 @@ code { background: rgba(127,127,127,.16); padding: 1px 5px; border-radius: 4px; 
 .stat .label { color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .stat.ok .value { color: #15803d; }
 .stat.bad .value { color: #b91c1c; }
+html { scroll-behavior: smooth; }
+.outline { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px; padding: 12px 16px 6px; margin-bottom: 24px; }
+.outline h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; }
+.outline table { font-size: 13px; }
+.outline a { color: #4338ca; text-decoration: none; }
+.outline a:hover { text-decoration: underline; }
+.outline .pass { color: #15803d; }
+.outline .fail { color: #b91c1c; }
+.table-scroll { overflow-x: auto; }
 .rule { background: #fff; border: 1px solid #e3e6ea; border-left: 5px solid #9ca3af; border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
 .rule.passed { border-left-color: #15803d; }
 .rule.failed { border-left-color: #b91c1c; }
 .rule header { display: flex; align-items: center; gap: 10px; }
 .rule h2 { margin: 0; font-size: 18px; }
-.badge { margin-left: auto; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+.rule header .actions { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.back { font-size: 12px; color: #4338ca; text-decoration: none; white-space: nowrap; }
+.back:hover { text-decoration: underline; }
+.badge { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
 .badge.passed { background: #dcfce7; color: #15803d; }
 .badge.failed { background: #fee2e2; color: #b91c1c; }
 .columns { color: #4b5563; margin: 6px 0 10px; }
@@ -360,7 +417,7 @@ details { margin-top: 10px; }
 summary { cursor: pointer; color: #4338ca; }
 @media (prefers-color-scheme: dark) {
   body { background: #10131a; color: #e5e7eb; }
-  .stat, .rule { background: #171b24; border-color: #2a3040; }
+  .stat, .rule, .outline { background: #171b24; border-color: #2a3040; }
   th, td { border-color: #2a3040; }
   tbody tr:nth-child(odd) { background: #1b202b; }
   .chip { background: #1b202b; border-color: #2a3040; }

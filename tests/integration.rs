@@ -204,6 +204,27 @@ fn html_report_is_self_contained() {
     assert!(stdout.contains("class=\"rule failed\""));
     assert!(stdout.contains("Ambiguous input"));
     assert!(stdout.contains("</html>"));
+
+    // Outline with anchors and back links.
+    assert!(stdout.contains("id=\"outline\""), "missing outline");
+    assert!(stdout.contains("id=\"rule-1\""), "missing rule anchor");
+    assert!(stdout.contains("href=\"#rule-4\""), "outline link missing");
+    assert!(stdout.contains("href=\"#outline\""), "back link missing");
+
+    // The outline is sorted by target column name.
+    let outline = {
+        let start = stdout.find("id=\"outline\"").unwrap();
+        let end = stdout[start..].find("</nav>").unwrap() + start;
+        &stdout[start..end]
+    };
+    let positions: Vec<usize> = ["city_code", "country_code", "end_date", "ref_tags"]
+        .iter()
+        .map(|name| outline.find(name).unwrap())
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "outline is not sorted by target: {positions:?}"
+    );
 }
 
 #[test]
