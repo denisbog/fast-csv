@@ -208,8 +208,8 @@ pub struct RuleDef {
     /// When this predicate holds, the row is counted as skipped instead of
     /// being validated.
     pub skip: Option<Predicate>,
-    /// Rows where this predicate is false are excluded from mapping extraction
-    /// and skipped during validation.
+    /// Selects which rows define a mapping: data rows for `mapping = auto`,
+    /// reference rows for `mapping_files`. It never skips validation.
     pub mapping_filter: Option<Predicate>,
     pub mapping: MappingSourceDef,
     pub report_limit: Option<usize>,

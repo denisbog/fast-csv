@@ -146,7 +146,7 @@ several lines as long as brackets/quotes balance.
 | `trim` | Trim each extracted cell (and reference-file cell) before transforming (default `false`). |
 | `allow_empty` (alias `optional`) | When `true`, a row whose source and target are both empty is **skipped** instead of failed (default `false`). |
 | `validation_skipped` (aliases `skip_when`, `skip`) | A predicate; rows where it holds are counted as **skipped** (see [Row predicates](#row-predicates)). |
-| `mapping_filter` | A predicate; rows where it does **not** hold are excluded from auto-mapping extraction and skipped during validation. |
+| `mapping_filter` | A predicate selecting which rows **define a mapping**. For `mapping = auto` it runs over the data rows; for `mapping_files` it runs over the reference rows (columns resolved against each file's header). It never skips validation. |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
 | `mapping_left`, `mapping_right` | Column(s) inside the reference files; lists are allowed. |
@@ -271,6 +271,13 @@ A mapping is the relation `left value → target value(s)`.
   targets are normalized exactly like the data. `Paris → PAR` in one file and
   `Paris → PAR2` in another is reported as an ambiguity. Any known target is
   accepted; unmatched left values fail and are counted as `unmapped_values`.
+  A `mapping_filter` restricts which reference rows are loaded (see
+  [Row predicates](#row-predicates)).
+
+Reference files are parsed **once** and cached for the whole run. Rules that
+ask for the same files with the same columns, transforms and filter share a
+single in-memory relation, so a lookup table used by several rules is neither
+re-read nor re-parsed (and identical requirements reuse the built mapping).
 
 Pass 1 builds the auto mapping in parallel (per-segment local counters merged at
 the end); pass 2 validates against it.
@@ -356,7 +363,7 @@ fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_
 ### Row predicates
 
 `validation_skipped` and `mapping_filter` take a small boolean expression over
-the row's cells. It is evaluated on the raw cell value (trimmed when
+a row's cells. It is evaluated on the raw cell value (trimmed when
 `trim = true`), before any transform:
 
 | Predicate | Meaning |
@@ -371,8 +378,16 @@ the row's cells. It is evaluated on the raw cell value (trimmed when
 
 `validation_skipped` generalizes `allow_empty`: whenever the predicate holds,
 the row is counted as `skipped` regardless of the source/target values.
-`mapping_filter` generalizes it further for mapping rules — only rows matching
-the filter contribute to an `auto` mapping, and non-matching rows are skipped.
+
+`mapping_filter` instead selects which rows **define the mapping** — it never
+skips validation, so a filtered-out row is still checked against the resulting
+relation:
+
+* with `mapping = auto` it runs over the **data rows**, so only matching rows
+  are observed while the relation is extracted;
+* with `mapping_files` it runs over the **reference rows**, so only matching
+  lookup entries are loaded. This is the place to filter on extra reference
+  columns such as a category or version.
 
 ```text
 rule "only primary rows define the mapping" {
@@ -380,6 +395,17 @@ rule "only primary rows define the mapping" {
   right          = country_code
   mapping        = auto
   mapping_filter = eq(row_kind, "primary")
+}
+
+# Only the "standard" rows of the reference file are loaded; a deprecated
+# entry is ignored and reported as an unmapped value.
+rule "standard reference rows only" {
+  left           = country_name
+  right          = country_code
+  mapping_files  = ["examples/loose_map.csv"]
+  mapping_left   = code
+  mapping_right  = expected
+  mapping_filter = eq(category, "standard")
 }
 
 rule "archived rows are not validated" {

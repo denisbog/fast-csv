@@ -24,17 +24,21 @@ rule "sentinel rows are skipped" {
   validation_skipped = any_in([code_a, code_b, code_c], ["SKIP", "N/A"])
 }
 
-# A `mapping_filter` restricts the relation to primary rows: secondary rows are
-# skipped, and only primary rows feed the mapping if it is auto-extracted.
-rule "reference mapping restricted to primary rows" {
+# `mapping_filter` selects which *reference rows* define the mapping: only rows
+# whose `category` column is "standard" are loaded. The `LEGACY` entry is
+# ignored, so that data value is reported as unmapped.
+rule "only standard reference rows define the mapping" {
   left           = or(code_a, code_b, code_c)
   right          = expected
   mapping_files  = ["examples/loose_map.csv"]
   mapping_left   = code
   mapping_right  = expected
-  mapping_filter = eq(kind, "primary")
+  mapping_filter = eq(category, "standard")
 }
 
+# For an `auto` mapping the filter runs over the *data* rows: only primary rows
+# are observed when the relation is extracted. Filtered rows are still
+# validated (unlike `validation_skipped`).
 rule "auto mapping only sees primary rows" {
   left           = or(code_a, code_b, code_c)
   right          = expected

@@ -30,6 +30,19 @@ impl Separator {
             Separator::Regex(pattern) => pattern.split(value).collect(),
         }
     }
+    /// Append a stable signature used to key the mapping cache.
+    pub fn signature(&self, out: &mut String) {
+        match self {
+            Separator::Literal(literal) => {
+                out.push_str("lit:");
+                out.push_str(literal);
+            }
+            Separator::Regex(pattern) => {
+                out.push_str("re:");
+                out.push_str(pattern.as_str());
+            }
+        }
+    }
 }
 
 impl Default for Separator {

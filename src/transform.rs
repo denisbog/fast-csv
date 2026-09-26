@@ -40,6 +40,46 @@ pub enum Transform {
 }
 
 impl Transform {
+    /// Append a stable, human-readable signature used to key the mapping cache.
+    pub fn signature(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            Transform::Lower => out.push_str("lower"),
+            Transform::Upper => out.push_str("upper"),
+            Transform::Trim => out.push_str("trim"),
+            Transform::Collapse => out.push_str("collapse"),
+            Transform::Date { inputs, output } => {
+                let _ = write!(out, "date({:?}->{output})", inputs);
+            }
+            Transform::Int => out.push_str("int"),
+            Transform::Float => out.push_str("float"),
+            Transform::Bool => out.push_str("bool"),
+            Transform::Replace { from, to } => {
+                let _ = write!(out, "replace({from:?},{to:?})");
+            }
+            Transform::RegexReplace {
+                pattern,
+                replacement,
+            } => {
+                let _ = write!(out, "regex_replace({:?},{replacement:?})", pattern.as_str());
+            }
+            Transform::RegexExtract { pattern, group } => {
+                let _ = write!(out, "extract({:?},{group})", pattern.as_str());
+            }
+            Transform::RegexKeep { pattern } => {
+                let _ = write!(out, "keep({:?})", pattern.as_str());
+            }
+            Transform::Prefix(value) => {
+                let _ = write!(out, "prefix({value:?})");
+            }
+            Transform::Suffix(value) => {
+                let _ = write!(out, "suffix({value:?})");
+            }
+        }
+    }
+}
+
+impl Transform {
     /// Apply the transform, appending the result to `out`.
     ///
     /// Returns `false` when a parsing transform failed; in that case `out` is

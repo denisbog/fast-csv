@@ -191,7 +191,7 @@ impl Slots {
             if let Some(predicate) = &rule.skip {
                 predicate.collect_indices(&mut needed);
             }
-            if let Some(predicate) = &rule.mapping_filter {
+            if let Some(predicate) = &rule.auto_mapping_filter {
                 predicate.collect_indices(&mut needed);
             }
         }
@@ -280,66 +280,15 @@ fn compose_side(
     }
 }
 
-/// The trimmed (or raw) single value a predicate looks at, or `None` when the
-/// selected column(s) are empty.
+/// Evaluate a compiled predicate against the extracted row cells.
 #[inline]
-fn predicate_value<'a>(
-    side: &ColumnRef,
-    cells: &'a [String],
-    slots: &Slots,
-    trim: bool,
-) -> Option<&'a str> {
-    let normalize = |value: &'a str| if trim { value.trim() } else { value };
-    match side {
-        ColumnRef::Columns(columns) => {
-            let value = normalize(slots.cell(cells, columns[0]));
-            (!value.is_empty()).then_some(value)
-        }
-        ColumnRef::Or(columns) => columns
-            .iter()
-            .map(|&column| normalize(slots.cell(cells, column)))
-            .find(|value| !value.is_empty()),
-    }
-}
-
-fn eval_predicate(
+fn predicate_holds(
     predicate: &CompiledPredicate,
     cells: &[String],
     slots: &Slots,
     trim: bool,
 ) -> bool {
-    match predicate {
-        CompiledPredicate::Const(value) => *value,
-        CompiledPredicate::In { column, values } => predicate_value(column, cells, slots, trim)
-            .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
-        CompiledPredicate::AnyIn { columns, values } => columns.iter().any(|column| {
-            predicate_value(column, cells, slots, trim)
-                .is_some_and(|value| values.iter().any(|candidate| candidate == value))
-        }),
-        CompiledPredicate::AllIn { columns, values } => columns.iter().all(|column| {
-            predicate_value(column, cells, slots, trim)
-                .is_some_and(|value| values.iter().any(|candidate| candidate == value))
-        }),
-        CompiledPredicate::Eq { column, value } => {
-            predicate_value(column, cells, slots, trim) == Some(value.as_str())
-        }
-        CompiledPredicate::Ne { column, value } => {
-            predicate_value(column, cells, slots, trim) != Some(value.as_str())
-        }
-        CompiledPredicate::Empty { column } => {
-            predicate_value(column, cells, slots, trim).is_none()
-        }
-        CompiledPredicate::NotEmpty { column } => {
-            predicate_value(column, cells, slots, trim).is_some()
-        }
-        CompiledPredicate::And(parts) => parts
-            .iter()
-            .all(|part| eval_predicate(part, cells, slots, trim)),
-        CompiledPredicate::Or(parts) => parts
-            .iter()
-            .any(|part| eval_predicate(part, cells, slots, trim)),
-        CompiledPredicate::Not(inner) => !eval_predicate(inner, cells, slots, trim),
-    }
+    predicate.evaluate(&|column| slots.cell(cells, column), trim)
 }
 
 // ---------------------------------------------------------------------------
@@ -388,15 +337,15 @@ fn build_counts_segment(
         for (position, &rule_index) in auto_indices.iter().enumerate() {
             let rule = &rules[rule_index];
 
-            // Rows skipped for validation, or excluded by the mapping filter,
-            // do not contribute to an auto-extracted mapping.
+            // Rows skipped for validation, or excluded by the auto-mapping
+            // filter, do not contribute to the extracted mapping.
             if let Some(predicate) = &rule.skip {
-                if eval_predicate(predicate, &cells, slots, rule.trim) {
+                if predicate_holds(predicate, &cells, slots, rule.trim) {
                     continue;
                 }
             }
-            if let Some(predicate) = &rule.mapping_filter {
-                if !eval_predicate(predicate, &cells, slots, rule.trim) {
+            if let Some(predicate) = &rule.auto_mapping_filter {
+                if !predicate_holds(predicate, &cells, slots, rule.trim) {
                     continue;
                 }
             }
@@ -447,7 +396,7 @@ fn validate_segment(
     path: &Path,
     delimiter: u8,
     rules: &[crate::rules::CompiledRule],
-    mappings: &[Option<Mapping>],
+    mappings: &[Option<Arc<Mapping>>],
     slots: &Slots,
     from: u64,
     to: u64,
@@ -486,17 +435,11 @@ fn validate_segment(
         for (rule_index, rule) in rules.iter().enumerate() {
             let accum = &mut accums[rule_index];
 
-            // An explicit `validation_skipped` predicate, or a `mapping_filter`
-            // that does not match, marks the row as skipped.
+            // An explicit `validation_skipped` predicate marks the row as
+            // skipped. `mapping_filter` no longer skips validation; it only
+            // selects which rows define the mapping.
             if let Some(predicate) = &rule.skip {
-                if eval_predicate(predicate, &cells, slots, rule.trim) {
-                    accum.checked += 1;
-                    accum.skipped += 1;
-                    continue;
-                }
-            }
-            if let Some(predicate) = &rule.mapping_filter {
-                if !eval_predicate(predicate, &cells, slots, rule.trim) {
+                if predicate_holds(predicate, &cells, slots, rule.trim) {
                     accum.checked += 1;
                     accum.skipped += 1;
                     continue;
@@ -602,7 +545,7 @@ fn validate_segment(
                 actual_buf.dedup();
 
                 matched = left_ok && right_ok && rule.compare.evaluate(&expected_buf, &actual_buf);
-                expected_repr = mapping_expected(mappings[rule_index].as_ref(), &expected_buf);
+                expected_repr = mapping_expected(mappings[rule_index].as_deref(), &expected_buf);
             }
 
             accum.checked += 1;
@@ -677,8 +620,10 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
 
     let slots = Slots::build(plan, id_idx);
 
-    // Resolve file-based mappings up-front.
-    let mut mappings: Vec<Option<Mapping>> = Vec::with_capacity(plan.rules.len());
+    // Resolve file-based mappings up-front, reusing parsed reference tables
+    // and equivalent mappings across rules.
+    let mut cache = mapping::MappingCache::new();
+    let mut mappings: Vec<Option<Arc<Mapping>>> = Vec::with_capacity(plan.rules.len());
     for rule in &plan.rules {
         let mapping = match &rule.mapping {
             MappingPlan::Files {
@@ -687,21 +632,24 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                 right,
                 multi,
                 separator,
-            } => mapping::load_from_files(
-                files,
-                &mapping::FileMappingSpec {
-                    left_columns: left,
-                    right_columns: right,
-                    left_transforms: &rule.transform_left,
-                    right_transforms: &rule.transform_right,
-                    multi: *multi,
-                    value_separator: separator,
-                    join_separator: &rule.join_separator,
-                    trim: rule.trim,
-                    delimiter: config.delimiter,
-                },
-            )
-            .map(Some)?,
+                filter,
+            } => cache
+                .load(
+                    files,
+                    &mapping::FileMappingSpec {
+                        left_columns: left,
+                        right_columns: right,
+                        left_transforms: &rule.transform_left,
+                        right_transforms: &rule.transform_right,
+                        multi: *multi,
+                        value_separator: separator,
+                        join_separator: &rule.join_separator,
+                        trim: rule.trim,
+                        delimiter: config.delimiter,
+                        filter: filter.as_ref(),
+                    },
+                )
+                .map(Some)?,
             _ => None,
         };
         mappings.push(mapping);
@@ -757,8 +705,9 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
             }
         }
         for (position, &rule_index) in auto_indices.iter().enumerate() {
-            mappings[rule_index] =
-                Some(Mapping::from_counts_auto(std::mem::take(&mut totals[position])));
+            mappings[rule_index] = Some(Arc::new(Mapping::from_counts_auto(
+                std::mem::take(&mut totals[position]),
+            )));
         }
     }
 
@@ -803,7 +752,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
 fn build_report(
     plan: &Plan,
     accums: Vec<RuleAccum>,
-    mappings: Vec<Option<Mapping>>,
+    mappings: Vec<Option<Arc<Mapping>>>,
 ) -> Report {
     let mut rules = Vec::with_capacity(plan.rules.len());
     let mut rows_checked = 0u64;

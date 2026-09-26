@@ -280,34 +280,36 @@ fn fallback_skip_and_mapping_filter() {
         "--no-fail",
     ]);
 
-    assert_eq!(report["rows_checked"], 7);
+    assert_eq!(report["rows_checked"], 8);
     let rules = report["rules"].as_array().unwrap();
 
-    // `or(a, b, c)` uses the first non-empty column; rows 6 and 7 disagree.
+    // `or(a, b, c)` uses the first non-empty column; rows 5-8 disagree.
     assert_eq!(rules[0]["left"], "or(code_a, code_b, code_c)");
     assert_eq!(rules[0]["rows_passed"], 4);
-    assert_eq!(rules[0]["rows_failed"], 3);
+    assert_eq!(rules[0]["rows_failed"], 4);
     assert_eq!(rules[0]["rows_skipped"], 0);
 
     // `validation_skipped = in(status, [...])` skips row 4 (archived).
     assert_eq!(rules[1]["rows_skipped"], 1);
-    assert_eq!(rules[1]["rows_failed"], 3);
+    assert_eq!(rules[1]["rows_failed"], 4);
 
     // `validation_skipped = any_in([...], [...])` skips row 7 (code SKIP).
     assert_eq!(rules[2]["rows_skipped"], 1);
-    assert_eq!(rules[2]["rows_failed"], 2);
+    assert_eq!(rules[2]["rows_failed"], 3);
 
-    // A reference mapping with `mapping_filter = eq(kind, "primary")` skips
-    // the secondary row.
-    assert_eq!(rules[3]["rows_skipped"], 1);
-    assert_eq!(rules[3]["rows_failed"], 2);
+    // `mapping_filter = eq(category, "standard")` filters the *reference rows*:
+    // LEGACY is excluded, so row 8 is unmapped and fails.
+    assert_eq!(rules[3]["rows_skipped"], 0);
+    assert_eq!(rules[3]["rows_failed"], 3);
+    assert_eq!(rules[3]["unmapped_values"], 1);
+    assert_eq!(rules[3]["mapping"]["distinct_inputs"], 6);
 
-    // The auto-extracted mapping must only see primary rows, so the filtered
-    // out `FR -> ZZ` row does not make `FR` ambiguous.
-    assert_eq!(rules[4]["mapping"]["distinct_inputs"], 6);
+    // For `auto` the filter runs over the data rows, so the secondary `FR -> ZZ`
+    // row does not make `FR` ambiguous — but it is still validated and fails.
+    assert_eq!(rules[4]["mapping"]["distinct_inputs"], 7);
     assert_eq!(rules[4]["mapping"]["ambiguous_inputs"], 0);
-    assert_eq!(rules[4]["rows_skipped"], 1);
-    assert_eq!(rules[4]["rows_failed"], 0);
+    assert_eq!(rules[4]["rows_skipped"], 0);
+    assert_eq!(rules[4]["rows_failed"], 1);
 }
 
 /// xan-style regex: `regex(...)` in transforms, a rule `pattern`, and a

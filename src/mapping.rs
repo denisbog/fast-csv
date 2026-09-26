@@ -11,9 +11,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use simd_csv::ByteRecord;
 
+use crate::dsl::Predicate;
 use crate::pattern::Separator;
 use crate::rules::ColumnResolver;
 
@@ -112,14 +114,9 @@ pub fn pair_tokens<'a>(
     left.iter().copied().zip(right.iter().copied())
 }
 
-/// Load a mapping from one or more reference files.
-///
-/// Each file is read with its own header row. `left_columns` and
-/// `right_columns` are resolved against it; when more than one column is given
-/// they are combined into a composite key with `join_separator`. The rule's
-/// transforms are applied to the reference values too, so that keys and targets
-/// are normalized exactly like the data being validated. When `multi` is true,
-/// values are split on `value_separator` and paired positionally.
+/// Specification for loading a mapping from reference files. All the rule's
+/// normalization options are applied to the reference values, so keys and
+/// targets match the data exactly.
 pub struct FileMappingSpec<'a> {
     pub left_columns: &'a [String],
     pub right_columns: &'a [String],
@@ -130,6 +127,122 @@ pub struct FileMappingSpec<'a> {
     pub join_separator: &'a str,
     pub trim: bool,
     pub delimiter: u8,
+    /// Optional predicate over reference rows; only matching rows define the
+    /// mapping. Column names are resolved against each file's own header.
+    pub filter: Option<&'a Predicate>,
+}
+
+/// The raw contents of one reference file, parsed once and reused.
+struct ReferenceTable {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+/// Caches parsed reference tables and the mappings built from them across
+/// rules. Rules that ask for the same files with the same columns, transforms
+/// and filter share a single `Mapping` and never re-read the file.
+#[derive(Default)]
+pub struct MappingCache {
+    tables: HashMap<(PathBuf, u8), Arc<ReferenceTable>>,
+    mappings: HashMap<String, Arc<Mapping>>,
+}
+
+impl MappingCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load(&mut self, files: &[PathBuf], spec: &FileMappingSpec) -> Result<Arc<Mapping>, String> {
+        if files.is_empty() {
+            return Err("mapping_files is set but no files were provided".to_string());
+        }
+
+        let key = mapping_signature(files, spec);
+        if let Some(mapping) = self.mappings.get(&key) {
+            return Ok(mapping.clone());
+        }
+
+        let mapping = Arc::new(self.build(files, spec)?);
+        self.mappings.insert(key, mapping.clone());
+        Ok(mapping)
+    }
+
+    fn table(&mut self, path: &Path, delimiter: u8) -> Result<Arc<ReferenceTable>, String> {
+        let key = (path.to_path_buf(), delimiter);
+        if let Some(table) = self.tables.get(&key) {
+            return Ok(table.clone());
+        }
+        let table = Arc::new(read_table(path, delimiter)?);
+        self.tables.insert(key, table.clone());
+        Ok(table)
+    }
+
+    fn build(&mut self, files: &[PathBuf], spec: &FileMappingSpec) -> Result<Mapping, String> {
+        let mut counts: MapCounts = HashMap::new();
+        let mut left_scratch = String::new();
+        let mut right_scratch = String::new();
+        let mut left_key = String::new();
+        let mut right_key = String::new();
+
+        for path in files {
+            let table = self.table(path, spec.delimiter)?;
+            let left_idx = resolve_columns(path, spec.left_columns, &table.headers, "left")?;
+            let right_idx = resolve_columns(path, spec.right_columns, &table.headers, "right")?;
+
+            // The filter is compiled against this file's own header row.
+            let filter = match spec.filter {
+                Some(predicate) => Some(crate::rules::compile_predicate(
+                    &format!("mapping file {}", path.display()),
+                    predicate,
+                    &table.headers,
+                )?),
+                None => None,
+            };
+
+            for row in &table.rows {
+                if let Some(filter) = &filter {
+                    let get = |column: usize| row.get(column).map(String::as_str).unwrap_or("");
+                    if !filter.evaluate(&get, spec.trim) {
+                        continue;
+                    }
+                }
+
+                crate::transform::compose(
+                    left_idx
+                        .iter()
+                        .map(|&i| row.get(i).map(String::as_str).unwrap_or("")),
+                    spec.left_transforms,
+                    spec.join_separator,
+                    spec.trim,
+                    &mut left_scratch,
+                    &mut left_key,
+                );
+                crate::transform::compose(
+                    right_idx
+                        .iter()
+                        .map(|&i| row.get(i).map(String::as_str).unwrap_or("")),
+                    spec.right_transforms,
+                    spec.join_separator,
+                    spec.trim,
+                    &mut right_scratch,
+                    &mut right_key,
+                );
+
+                let left_tokens = split_tokens(&left_key, spec.multi, spec.value_separator);
+                let right_tokens = split_tokens(&right_key, spec.multi, spec.value_separator);
+
+                for (l, r) in pair_tokens(&left_tokens, &right_tokens) {
+                    *counts
+                        .entry(l.into())
+                        .or_default()
+                        .entry(r.into())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        Ok(Mapping::from_counts(counts, MappingOrigin::File))
+    }
 }
 
 fn resolve_columns(
@@ -154,83 +267,155 @@ fn resolve_columns(
         .collect()
 }
 
-pub fn load_from_files(files: &[PathBuf], spec: &FileMappingSpec) -> Result<Mapping, String> {
-    if files.is_empty() {
-        return Err("mapping_files is set but no files were provided".to_string());
-    }
+fn read_table(path: &Path, delimiter: u8) -> Result<ReferenceTable, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open mapping file {}: {e}", path.display()))?;
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(64 * 1024);
+    builder
+        .delimiter(delimiter)
+        .has_headers(true)
+        .flexible(true);
+    let mut reader = builder.from_reader(file);
 
-    let mut counts: MapCounts = HashMap::new();
-    let mut left_scratch = String::new();
-    let mut right_scratch = String::new();
-    let mut left_key = String::new();
-    let mut right_key = String::new();
+    let headers: Vec<String> = {
+        let record = reader
+            .byte_headers()
+            .map_err(|e| format!("cannot read headers of {}: {e}", path.display()))?;
+        record
+            .iter()
+            .map(|cell| String::from_utf8_lossy(cell).into_owned())
+            .collect()
+    };
 
-    for path in files {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("cannot open mapping file {}: {e}", path.display()))?;
-        let mut builder = simd_csv::ReaderBuilder::with_capacity(64 * 1024);
-        builder
-            .delimiter(spec.delimiter)
-            .has_headers(true)
-            .flexible(true);
-        let mut reader = builder.from_reader(file);
-
-        let headers: Vec<String> = {
-            let record = reader
-                .byte_headers()
-                .map_err(|e| format!("cannot read headers of {}: {e}", path.display()))?;
-            record
-                .iter()
-                .map(|c| String::from_utf8_lossy(c).into_owned())
-                .collect()
-        };
-
-        let left_idx = resolve_columns(path, spec.left_columns, &headers, "left")?;
-        let right_idx = resolve_columns(path, spec.right_columns, &headers, "right")?;
-
-        let mut record = ByteRecord::new();
-        loop {
-            match reader.read_byte_record(&mut record) {
-                Ok(false) => break,
-                Ok(true) => {}
-                Err(e) => {
-                    return Err(format!("error reading {}: {e}", path.display()));
-                }
-            }
-
-            crate::transform::compose(
-                left_idx
+    let mut rows = Vec::new();
+    let mut record = ByteRecord::new();
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => rows.push(
+                record
                     .iter()
-                    .map(|&i| String::from_utf8_lossy(record.get(i).unwrap_or(b""))),
-                spec.left_transforms,
-                spec.join_separator,
-                spec.trim,
-                &mut left_scratch,
-                &mut left_key,
-            );
-            crate::transform::compose(
-                right_idx
-                    .iter()
-                    .map(|&i| String::from_utf8_lossy(record.get(i).unwrap_or(b""))),
-                spec.right_transforms,
-                spec.join_separator,
-                spec.trim,
-                &mut right_scratch,
-                &mut right_key,
-            );
-
-            let left_tokens = split_tokens(&left_key, spec.multi, spec.value_separator);
-            let right_tokens = split_tokens(&right_key, spec.multi, spec.value_separator);
-
-            for (l, r) in pair_tokens(&left_tokens, &right_tokens) {
-                *counts
-                    .entry(l.into())
-                    .or_default()
-                    .entry(r.into())
-                    .or_insert(0) += 1;
-            }
+                    .map(|cell| String::from_utf8_lossy(cell).into_owned())
+                    .collect(),
+            ),
+            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
         }
     }
 
-    Ok(Mapping::from_counts(counts, MappingOrigin::File))
+    Ok(ReferenceTable { headers, rows })
+}
+
+/// A deterministic key describing exactly what a rule needs from a set of
+/// reference files, so equivalent rules share one `Mapping`.
+fn mapping_signature(files: &[PathBuf], spec: &FileMappingSpec) -> String {
+    let mut out = String::new();
+    for file in files {
+        out.push_str(&file.display().to_string());
+        out.push('\u{1f}');
+    }
+    out.push_str(&spec.left_columns.join("\u{1e}"));
+    out.push('\u{1f}');
+    out.push_str(&spec.right_columns.join("\u{1e}"));
+    out.push('\u{1f}');
+    for transform in spec.left_transforms {
+        transform.signature(&mut out);
+        out.push('\u{1e}');
+    }
+    out.push('\u{1f}');
+    for transform in spec.right_transforms {
+        transform.signature(&mut out);
+        out.push('\u{1e}');
+    }
+    out.push('\u{1f}');
+    out.push_str(if spec.multi { "multi=1" } else { "multi=0" });
+    out.push_str(";sep=");
+    spec.value_separator.signature(&mut out);
+    out.push_str(";join=");
+    out.push_str(spec.join_separator);
+    out.push_str(if spec.trim { ";trim=1" } else { ";trim=0" });
+    out.push_str(";filter=");
+    if let Some(filter) = spec.filter {
+        out.push_str(&format!("{filter:?}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::{ColumnSpec, Predicate};
+
+    fn spec<'a>(
+        left: &'a [String],
+        right: &'a [String],
+        separator: &'a Separator,
+        filter: Option<&'a Predicate>,
+    ) -> FileMappingSpec<'a> {
+        FileMappingSpec {
+            left_columns: left,
+            right_columns: right,
+            left_transforms: &[],
+            right_transforms: &[],
+            multi: false,
+            value_separator: separator,
+            join_separator: "|",
+            trim: false,
+            delimiter: b',',
+            filter,
+        }
+    }
+
+    fn path() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/loose_map.csv"))
+    }
+
+    #[test]
+    fn filters_reference_rows() {
+        let left = vec!["code".to_string()];
+        let right = vec!["expected".to_string()];
+        let separator = Separator::literal(",");
+        let filter = Predicate::Eq {
+            column: ColumnSpec::Columns(vec!["category".into()]),
+            value: "standard".into(),
+        };
+        let mut cache = MappingCache::new();
+        let mapping = cache
+            .load(&[path()], &spec(&left, &right, &separator, Some(&filter)))
+            .unwrap();
+
+        assert_eq!(mapping.expected("FR"), Some("FR"));
+        assert_eq!(mapping.expected("SKIP"), Some("WRONG"));
+        // The deprecated row was filtered out.
+        assert_eq!(mapping.expected("LEGACY"), None);
+        assert_eq!(mapping.len(), 6);
+    }
+
+    #[test]
+    fn caches_equivalent_mappings() {
+        let left = vec!["code".to_string()];
+        let right = vec!["expected".to_string()];
+        let separator = Separator::literal(",");
+        let mut cache = MappingCache::new();
+
+        let first = cache
+            .load(&[path()], &spec(&left, &right, &separator, None))
+            .unwrap();
+        let second = cache
+            .load(&[path()], &spec(&left, &right, &separator, None))
+            .unwrap();
+        // Same rule requirements -> the very same mapping, no re-read.
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // A different filter must build a different mapping.
+        let filter = Predicate::Eq {
+            column: ColumnSpec::Columns(vec!["category".into()]),
+            value: "deprecated".into(),
+        };
+        let filtered = cache
+            .load(&[path()], &spec(&left, &right, &separator, Some(&filter)))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &filtered));
+        assert_eq!(filtered.expected("LEGACY"), Some("OLD"));
+        assert_eq!(filtered.len(), 1);
+    }
 }

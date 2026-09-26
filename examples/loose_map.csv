@@ -1,7 +1,8 @@
-code,expected
-FR,FR
-US,US
-DE,DE
-IT,IT
-ES,ES
-SKIP,SKIP
+code,expected,category
+FR,FR,standard
+US,US,standard
+DE,DE,standard
+IT,IT,standard
+ES,ES,standard
+SKIP,WRONG,standard
+LEGACY,OLD,deprecated

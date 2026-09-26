@@ -45,6 +45,9 @@ pub enum MappingPlan {
         right: Vec<String>,
         multi: bool,
         separator: Separator,
+        /// Optional predicate over reference rows; only matching rows define
+        /// the mapping. Columns are resolved against each file's header.
+        filter: Option<Predicate>,
     },
 }
 
@@ -103,6 +106,56 @@ impl CompiledPredicate {
             CompiledPredicate::Const(_) => {}
         }
     }
+
+    /// Evaluate the predicate, reading a column's value through `get`.
+    pub fn evaluate<'a, F>(&self, get: &F, trim: bool) -> bool
+    where
+        F: Fn(usize) -> &'a str,
+    {
+        match self {
+            CompiledPredicate::Const(value) => *value,
+            CompiledPredicate::In { column, values } => value_of(column, get, trim)
+                .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
+            CompiledPredicate::AnyIn { columns, values } => columns.iter().any(|column| {
+                value_of(column, get, trim)
+                    .is_some_and(|value| values.iter().any(|candidate| candidate == value))
+            }),
+            CompiledPredicate::AllIn { columns, values } => columns.iter().all(|column| {
+                value_of(column, get, trim)
+                    .is_some_and(|value| values.iter().any(|candidate| candidate == value))
+            }),
+            CompiledPredicate::Eq { column, value } => {
+                value_of(column, get, trim) == Some(value.as_str())
+            }
+            CompiledPredicate::Ne { column, value } => {
+                value_of(column, get, trim) != Some(value.as_str())
+            }
+            CompiledPredicate::Empty { column } => value_of(column, get, trim).is_none(),
+            CompiledPredicate::NotEmpty { column } => value_of(column, get, trim).is_some(),
+            CompiledPredicate::And(parts) => parts.iter().all(|part| part.evaluate(get, trim)),
+            CompiledPredicate::Or(parts) => parts.iter().any(|part| part.evaluate(get, trim)),
+            CompiledPredicate::Not(inner) => !inner.evaluate(get, trim),
+        }
+    }
+}
+
+/// The single normalized value a predicate looks at, or `None` when the
+/// selected column(s) are empty.
+fn value_of<'a, F>(side: &ColumnRef, get: &F, trim: bool) -> Option<&'a str>
+where
+    F: Fn(usize) -> &'a str,
+{
+    let normalize = |value: &'a str| if trim { value.trim() } else { value };
+    match side {
+        ColumnRef::Columns(columns) => {
+            let value = normalize(get(columns[0]));
+            (!value.is_empty()).then_some(value)
+        }
+        ColumnRef::Or(columns) => columns
+            .iter()
+            .map(|&column| normalize(get(column)))
+            .find(|value| !value.is_empty()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,9 +179,10 @@ pub struct CompiledRule {
     pub allow_empty: bool,
     /// When this holds, the row is skipped (see `validation_skipped`).
     pub skip: Option<CompiledPredicate>,
-    /// When this does not hold, the row is excluded from mapping extraction
-    /// and skipped during validation.
-    pub mapping_filter: Option<CompiledPredicate>,
+    /// Predicate restricting which data rows an `auto` mapping observes
+    /// (compiled against the input headers). `None` for file mappings, whose
+    /// filter is resolved against each reference file instead.
+    pub auto_mapping_filter: Option<CompiledPredicate>,
     pub mapping: MappingPlan,
     pub report_limit: usize,
 }
@@ -138,7 +192,7 @@ pub struct Plan {
 }
 
 fn resolve_all(
-    rule: &str,
+    context: &str,
     side: &str,
     columns: &[String],
     headers: &[String],
@@ -148,7 +202,7 @@ fn resolve_all(
         .map(|column| {
             ColumnResolver::resolve(column, headers).ok_or_else(|| {
                 format!(
-                    "rule '{rule}': {side} column '{column}' not found (available: {})",
+                    "{context}: {side} column '{column}' not found (available: {})",
                     headers.join(", ")
                 )
             })
@@ -157,12 +211,12 @@ fn resolve_all(
 }
 
 fn compile_columns(
-    rule: &str,
+    context: &str,
     side: &str,
     spec: &ColumnSpec,
     headers: &[String],
 ) -> Result<ColumnRef, String> {
-    let indices = resolve_all(rule, side, spec.names(), headers)?;
+    let indices = resolve_all(context, side, spec.names(), headers)?;
     Ok(match spec {
         ColumnSpec::Columns(_) => ColumnRef::Columns(indices),
         ColumnSpec::Or(_) => ColumnRef::Or(indices),
@@ -171,73 +225,75 @@ fn compile_columns(
 
 /// Predicates operate on a single value, so a composite list is not allowed.
 fn compile_condition_column(
-    rule: &str,
+    context: &str,
     spec: &ColumnSpec,
     headers: &[String],
 ) -> Result<ColumnRef, String> {
     if let ColumnSpec::Columns(names) = spec {
         if names.len() > 1 {
             return Err(format!(
-                "rule '{rule}': a predicate column must be a single column or or(...), got [{}]",
+                "{context}: a predicate column must be a single column or or(...), got [{}]",
                 names.join(", ")
             ));
         }
     }
-    compile_columns(rule, "condition", spec, headers)
+    compile_columns(context, "condition", spec, headers)
 }
 
-fn compile_predicate(
-    rule: &str,
+/// Compile a DSL predicate against a set of headers. `context` labels any
+/// resolution error (e.g. `rule 'x'` or `mapping file 'ref.csv'`).
+pub fn compile_predicate(
+    context: &str,
     predicate: &Predicate,
     headers: &[String],
 ) -> Result<CompiledPredicate, String> {
     Ok(match predicate {
         Predicate::In { column, values } => CompiledPredicate::In {
-            column: compile_condition_column(rule, column, headers)?,
+            column: compile_condition_column(context, column, headers)?,
             values: values.clone(),
         },
         Predicate::AnyIn { columns, values } => CompiledPredicate::AnyIn {
             columns: columns
                 .iter()
-                .map(|column| compile_condition_column(rule, column, headers))
+                .map(|column| compile_condition_column(context, column, headers))
                 .collect::<Result<Vec<_>, _>>()?,
             values: values.clone(),
         },
         Predicate::AllIn { columns, values } => CompiledPredicate::AllIn {
             columns: columns
                 .iter()
-                .map(|column| compile_condition_column(rule, column, headers))
+                .map(|column| compile_condition_column(context, column, headers))
                 .collect::<Result<Vec<_>, _>>()?,
             values: values.clone(),
         },
         Predicate::Eq { column, value } => CompiledPredicate::Eq {
-            column: compile_condition_column(rule, column, headers)?,
+            column: compile_condition_column(context, column, headers)?,
             value: value.clone(),
         },
         Predicate::Ne { column, value } => CompiledPredicate::Ne {
-            column: compile_condition_column(rule, column, headers)?,
+            column: compile_condition_column(context, column, headers)?,
             value: value.clone(),
         },
         Predicate::Empty { column } => CompiledPredicate::Empty {
-            column: compile_condition_column(rule, column, headers)?,
+            column: compile_condition_column(context, column, headers)?,
         },
         Predicate::NotEmpty { column } => CompiledPredicate::NotEmpty {
-            column: compile_condition_column(rule, column, headers)?,
+            column: compile_condition_column(context, column, headers)?,
         },
         Predicate::And(parts) => CompiledPredicate::And(
             parts
                 .iter()
-                .map(|part| compile_predicate(rule, part, headers))
+                .map(|part| compile_predicate(context, part, headers))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Predicate::Or(parts) => CompiledPredicate::Or(
             parts
                 .iter()
-                .map(|part| compile_predicate(rule, part, headers))
+                .map(|part| compile_predicate(context, part, headers))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Predicate::Not(inner) => {
-            CompiledPredicate::Not(Box::new(compile_predicate(rule, inner, headers)?))
+            CompiledPredicate::Not(Box::new(compile_predicate(context, inner, headers)?))
         }
         Predicate::Const(value) => CompiledPredicate::Const(*value),
     })
@@ -247,17 +303,13 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
     let mut rules = Vec::with_capacity(program.rules.len());
 
     for def in program.rules {
-        let left = compile_columns(&def.name, "left", &def.left, headers)?;
-        let right = compile_columns(&def.name, "right", &def.right, headers)?;
+        let context = format!("rule '{}'", def.name);
+        let left = compile_columns(&context, "left", &def.left, headers)?;
+        let right = compile_columns(&context, "right", &def.right, headers)?;
         let skip = def
             .skip
             .as_ref()
-            .map(|predicate| compile_predicate(&def.name, predicate, headers))
-            .transpose()?;
-        let mapping_filter = def
-            .mapping_filter
-            .as_ref()
-            .map(|predicate| compile_predicate(&def.name, predicate, headers))
+            .map(|predicate| compile_predicate(&context, predicate, headers))
             .transpose()?;
 
         let multi = def.multi.unwrap_or(program.defaults.multi);
@@ -310,7 +362,30 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
                 separator: separator
                     .clone()
                     .unwrap_or_else(|| program.defaults.mapping_separator.clone()),
+                // The reference filter is compiled later, against each file's
+                // own header row.
+                filter: def.mapping_filter.clone(),
             },
+        };
+
+        // `mapping_filter` filters the rows that define a mapping. For `auto`
+        // mappings that is resolved here; for file mappings it travels with
+        // the plan and is resolved per reference file.
+        let auto_mapping_filter = match &def.mapping {
+            MappingSourceDef::Auto => def
+                .mapping_filter
+                .as_ref()
+                .map(|predicate| compile_predicate(&context, predicate, headers))
+                .transpose()?,
+            MappingSourceDef::None => {
+                if def.mapping_filter.is_some() {
+                    return Err(format!(
+                        "{context}: `mapping_filter` requires `mapping = auto` or `mapping_files`"
+                    ));
+                }
+                None
+            }
+            MappingSourceDef::Files { .. } => None,
         };
 
         let left_name = def.left.display();
@@ -336,7 +411,7 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             trim,
             allow_empty,
             skip,
-            mapping_filter,
+            auto_mapping_filter,
             mapping,
             report_limit,
         });
